@@ -12,7 +12,8 @@ use crate::clock::corrected_utc_ms;
 use crate::config::AppConfig;
 use crate::telemetry::TelemetryEvent;
 use crate::types::{
-    AggTrade, AggTradeEvent, BookTicker, BookTickerEvent, DepthEvent, DepthSnapshot, DepthUpdate,
+    AggTradeEvent, BookTickerEvent, DepthEvent, DepthSnapshot, NormalizedAggTrade,
+    NormalizedBookTicker, NormalizedDepthUpdate,
 };
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +29,80 @@ struct DepthSnapshotResponse {
     bids: Vec<[String; 2]>,
     #[serde(rename = "asks")]
     asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceDepthUpdate {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+    #[serde(rename = "T")]
+    transaction_time_ms: Option<i64>,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "ps")]
+    pair: Option<String>,
+    #[serde(rename = "U")]
+    first_update_id: u64,
+    #[serde(rename = "u")]
+    final_update_id: u64,
+    #[serde(rename = "pu")]
+    prev_final_update_id: u64,
+    #[serde(rename = "b")]
+    bids: Vec<[String; 2]>,
+    #[serde(rename = "a")]
+    asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceBookTicker {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "u")]
+    update_id: u64,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+    #[serde(rename = "T")]
+    transaction_time_ms: Option<i64>,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "ps")]
+    pair: Option<String>,
+    #[serde(rename = "b")]
+    best_bid_price: String,
+    #[serde(rename = "B")]
+    best_bid_qty: String,
+    #[serde(rename = "a")]
+    best_ask_price: String,
+    #[serde(rename = "A")]
+    best_ask_qty: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAggTrade {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+    #[serde(rename = "T")]
+    trade_time_ms: i64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "ps")]
+    pair: Option<String>,
+    #[serde(rename = "a")]
+    aggregate_trade_id: u64,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    quantity: String,
+    #[serde(rename = "f")]
+    first_trade_id: u64,
+    #[serde(rename = "l")]
+    last_trade_id: u64,
+    #[serde(rename = "m")]
+    buyer_is_maker: bool,
 }
 
 pub async fn run_collector(
@@ -174,9 +249,56 @@ fn aligned_recv_ts_ms(event_ts_ms: i64) -> i64 {
     corrected_utc_ms().max(event_ts_ms)
 }
 
+fn normalize_depth_update(raw: BinanceDepthUpdate) -> NormalizedDepthUpdate {
+    NormalizedDepthUpdate {
+        event_type: raw.event_type,
+        event_time_ms: raw.event_time_ms,
+        transaction_time_ms: raw.transaction_time_ms,
+        symbol: raw.symbol,
+        pair: raw.pair,
+        first_update_id: raw.first_update_id,
+        final_update_id: raw.final_update_id,
+        prev_final_update_id: raw.prev_final_update_id,
+        bids: raw.bids,
+        asks: raw.asks,
+    }
+}
+
+fn normalize_book_ticker(raw: BinanceBookTicker) -> NormalizedBookTicker {
+    NormalizedBookTicker {
+        event_type: raw.event_type,
+        update_id: raw.update_id,
+        event_time_ms: raw.event_time_ms,
+        transaction_time_ms: raw.transaction_time_ms,
+        symbol: raw.symbol,
+        pair: raw.pair,
+        best_bid_price: raw.best_bid_price,
+        best_bid_qty: raw.best_bid_qty,
+        best_ask_price: raw.best_ask_price,
+        best_ask_qty: raw.best_ask_qty,
+    }
+}
+
+fn normalize_agg_trade(raw: BinanceAggTrade) -> NormalizedAggTrade {
+    NormalizedAggTrade {
+        event_type: raw.event_type,
+        event_time_ms: raw.event_time_ms,
+        trade_time_ms: raw.trade_time_ms,
+        symbol: raw.symbol,
+        pair: raw.pair,
+        aggregate_trade_id: raw.aggregate_trade_id,
+        price: raw.price,
+        quantity: raw.quantity,
+        first_trade_id: raw.first_trade_id,
+        last_trade_id: raw.last_trade_id,
+        buyer_is_maker: raw.buyer_is_maker,
+    }
+}
+
 async fn forward_depth_event(data: &serde_json::Value, tx: &mpsc::Sender<DepthEvent>) -> Result<()> {
-    let payload: DepthUpdate = serde_json::from_value(data.clone())
+    let raw_payload: BinanceDepthUpdate = serde_json::from_value(data.clone())
         .context("failed to decode depth update payload")?;
+    let payload = normalize_depth_update(raw_payload);
 
     if payload.event_type != "depthUpdate" {
         return Ok(());
@@ -197,8 +319,9 @@ async fn forward_book_ticker_event(
     data: &serde_json::Value,
     tx: &mpsc::Sender<BookTickerEvent>,
 ) -> Result<()> {
-    let payload: BookTicker =
+    let raw_payload: BinanceBookTicker =
         serde_json::from_value(data.clone()).context("failed to decode bookTicker payload")?;
+    let payload = normalize_book_ticker(raw_payload);
 
     if payload.event_type != "bookTicker" {
         return Ok(());
@@ -219,8 +342,9 @@ async fn forward_agg_trade_event(
     data: &serde_json::Value,
     tx: &mpsc::Sender<AggTradeEvent>,
 ) -> Result<()> {
-    let payload: AggTrade =
+    let raw_payload: BinanceAggTrade =
         serde_json::from_value(data.clone()).context("failed to decode aggTrade payload")?;
+    let payload = normalize_agg_trade(raw_payload);
 
     if payload.event_type != "aggTrade" {
         return Ok(());
@@ -239,9 +363,11 @@ async fn forward_agg_trade_event(
 }
 
 pub async fn fetch_depth_snapshot(config: &AppConfig, http_client: &Client) -> Result<DepthSnapshot> {
+    let rest_base = config.rest_base_url.trim_end_matches('/');
+    let depth_path = config.depth_snapshot_path.trim_start_matches('/');
     let endpoint = format!(
-        "{}/dapi/v1/depth?symbol={}&limit={}",
-        config.rest_base_url, config.symbol, config.depth_limit
+        "{}/{}?symbol={}&limit={}",
+        rest_base, depth_path, config.symbol, config.depth_limit
     );
 
     let response = http_client
@@ -284,4 +410,129 @@ fn parse_levels(levels: Vec<[String; 2]>) -> Result<Vec<(f64, f64)>> {
         parsed.push((price, qty));
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        normalize_agg_trade, normalize_book_ticker, normalize_depth_update, BinanceAggTrade,
+        BinanceBookTicker, BinanceDepthUpdate,
+    };
+
+    #[test]
+    fn normalizes_coin_m_wire_payloads() {
+        let depth_raw: BinanceDepthUpdate = serde_json::from_value(json!({
+            "e": "depthUpdate",
+            "E": 1_710_000_000_000i64,
+            "T": 1_710_000_000_001i64,
+            "s": "BTCUSD_PERP",
+            "ps": "BTCUSD",
+            "U": 100u64,
+            "u": 101u64,
+            "pu": 99u64,
+            "b": [["64000.1", "5"], ["64000.0", "2"]],
+            "a": [["64000.2", "4"]]
+        }))
+        .expect("coin-m depth payload should decode");
+        let depth = normalize_depth_update(depth_raw);
+        assert_eq!(depth.symbol, "BTCUSD_PERP");
+        assert_eq!(depth.pair.as_deref(), Some("BTCUSD"));
+        assert_eq!(depth.transaction_time_ms, Some(1_710_000_000_001i64));
+        assert_eq!(depth.first_update_id, 100u64);
+
+        let ticker_raw: BinanceBookTicker = serde_json::from_value(json!({
+            "e": "bookTicker",
+            "u": 700u64,
+            "E": 1_710_000_000_010i64,
+            "T": 1_710_000_000_011i64,
+            "s": "BTCUSD_PERP",
+            "ps": "BTCUSD",
+            "b": "64000.1",
+            "B": "3",
+            "a": "64000.2",
+            "A": "6"
+        }))
+        .expect("coin-m bookTicker payload should decode");
+        let ticker = normalize_book_ticker(ticker_raw);
+        assert_eq!(ticker.symbol, "BTCUSD_PERP");
+        assert_eq!(ticker.pair.as_deref(), Some("BTCUSD"));
+        assert_eq!(ticker.best_bid_price, "64000.1");
+        assert_eq!(ticker.best_ask_qty, "6");
+
+        let trade_raw: BinanceAggTrade = serde_json::from_value(json!({
+            "e": "aggTrade",
+            "E": 1_710_000_000_020i64,
+            "T": 1_710_000_000_021i64,
+            "s": "BTCUSD_PERP",
+            "ps": "BTCUSD",
+            "a": 42u64,
+            "p": "64000.15",
+            "q": "1",
+            "f": 900u64,
+            "l": 905u64,
+            "m": true
+        }))
+        .expect("coin-m aggTrade payload should decode");
+        let trade = normalize_agg_trade(trade_raw);
+        assert_eq!(trade.symbol, "BTCUSD_PERP");
+        assert_eq!(trade.pair.as_deref(), Some("BTCUSD"));
+        assert_eq!(trade.aggregate_trade_id, 42u64);
+        assert!(trade.buyer_is_maker);
+    }
+
+    #[test]
+    fn normalizes_usd_m_wire_payloads_without_optional_fields() {
+        let depth_raw: BinanceDepthUpdate = serde_json::from_value(json!({
+            "e": "depthUpdate",
+            "E": 1_710_100_000_000i64,
+            "s": "BTCUSDT",
+            "U": 200u64,
+            "u": 202u64,
+            "pu": 199u64,
+            "b": [["64010.0", "0.25"]],
+            "a": [["64010.1", "0.50"]]
+        }))
+        .expect("usd-m depth payload should decode");
+        let depth = normalize_depth_update(depth_raw);
+        assert_eq!(depth.symbol, "BTCUSDT");
+        assert_eq!(depth.pair, None);
+        assert_eq!(depth.transaction_time_ms, None);
+
+        let ticker_raw: BinanceBookTicker = serde_json::from_value(json!({
+            "e": "bookTicker",
+            "u": 1_500u64,
+            "E": 1_710_100_000_010i64,
+            "s": "BTCUSDT",
+            "b": "64010.0",
+            "B": "0.10",
+            "a": "64010.1",
+            "A": "0.20"
+        }))
+        .expect("usd-m bookTicker payload should decode");
+        let ticker = normalize_book_ticker(ticker_raw);
+        assert_eq!(ticker.symbol, "BTCUSDT");
+        assert_eq!(ticker.pair, None);
+        assert_eq!(ticker.transaction_time_ms, None);
+
+        let trade_raw: BinanceAggTrade = serde_json::from_value(json!({
+            "e": "aggTrade",
+            "E": 1_710_100_000_020i64,
+            "T": 1_710_100_000_021i64,
+            "s": "BTCUSDT",
+            "a": 77u64,
+            "p": "64010.05",
+            "q": "0.05",
+            "f": 2_100u64,
+            "l": 2_101u64,
+            "m": false
+        }))
+        .expect("usd-m aggTrade payload should decode");
+        let trade = normalize_agg_trade(trade_raw);
+        assert_eq!(trade.symbol, "BTCUSDT");
+        assert_eq!(trade.pair, None);
+        assert_eq!(trade.quantity, "0.05");
+        assert!(!trade.buyer_is_maker);
+    }
 }

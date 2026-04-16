@@ -16,79 +16,48 @@ pub struct VolumeChunk {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct DepthUpdate {
-    #[serde(rename = "e")]
+#[derive(Debug, Clone)]
+pub struct NormalizedDepthUpdate {
     pub event_type: String,
-    #[serde(rename = "E")]
     pub event_time_ms: i64,
-    #[serde(rename = "T")]
     pub transaction_time_ms: Option<i64>,
-    #[serde(rename = "s")]
     pub symbol: String,
-    #[serde(rename = "ps")]
     pub pair: Option<String>,
-    #[serde(rename = "U")]
     pub first_update_id: u64,
-    #[serde(rename = "u")]
     pub final_update_id: u64,
-    #[serde(rename = "pu")]
     pub prev_final_update_id: u64,
-    #[serde(rename = "b")]
     pub bids: Vec<[String; 2]>,
-    #[serde(rename = "a")]
     pub asks: Vec<[String; 2]>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct BookTicker {
-    #[serde(rename = "e")]
+#[derive(Debug, Clone)]
+pub struct NormalizedBookTicker {
     pub event_type: String,
-    #[serde(rename = "u")]
     pub update_id: u64,
-    #[serde(rename = "E")]
     pub event_time_ms: i64,
-    #[serde(rename = "T")]
     pub transaction_time_ms: Option<i64>,
-    #[serde(rename = "s")]
     pub symbol: String,
-    #[serde(rename = "ps")]
     pub pair: Option<String>,
-    #[serde(rename = "b")]
     pub best_bid_price: String,
-    #[serde(rename = "B")]
     pub best_bid_qty: String,
-    #[serde(rename = "a")]
     pub best_ask_price: String,
-    #[serde(rename = "A")]
     pub best_ask_qty: String,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct AggTrade {
-    #[serde(rename = "e")]
+#[derive(Debug, Clone)]
+pub struct NormalizedAggTrade {
     pub event_type: String,
-    #[serde(rename = "E")]
     pub event_time_ms: i64,
-    #[serde(rename = "T")]
     pub trade_time_ms: i64,
-    #[serde(rename = "s")]
     pub symbol: String,
-    #[serde(rename = "ps")]
     pub pair: Option<String>,
-    #[serde(rename = "a")]
     pub aggregate_trade_id: u64,
-    #[serde(rename = "p")]
     pub price: String,
-    #[serde(rename = "q")]
     pub quantity: String,
-    #[serde(rename = "f")]
     pub first_trade_id: u64,
-    #[serde(rename = "l")]
     pub last_trade_id: u64,
-    #[serde(rename = "m")]
     pub buyer_is_maker: bool,
 }
 
@@ -102,14 +71,14 @@ pub struct DepthSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct DepthEvent {
-    pub payload: DepthUpdate,
+    pub payload: NormalizedDepthUpdate,
     pub recv_ts_ms: i64,
     pub recv_instant: Instant,
 }
 
 #[derive(Debug, Clone)]
 pub struct BookTickerEvent {
-    pub payload: BookTicker,
+    pub payload: NormalizedBookTicker,
     pub recv_ts_ms: i64,
     pub raw_json: String,
 }
@@ -117,7 +86,7 @@ pub struct BookTickerEvent {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AggTradeEvent {
-    pub payload: AggTrade,
+    pub payload: NormalizedAggTrade,
     pub recv_ts_ms: i64,
     pub recv_instant: Instant,
     pub raw_json: String,

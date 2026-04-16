@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::binance;
 use crate::clock;
+use crate::connectors;
 use crate::config::AppConfig;
 use crate::health;
 use crate::orderbook;
@@ -64,7 +64,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let collector_config = config.clone();
     let collector_telemetry_tx = telemetry_tx.clone();
     let collector_task = tokio::spawn(async move {
-        binance::run_collector(
+        connectors::run_collector(
             collector_config,
             depth_tx,
             book_ticker_tx,

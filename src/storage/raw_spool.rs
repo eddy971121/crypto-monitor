@@ -17,7 +17,6 @@ use crate::types::{BookTickerEvent, RawBookTickerRow};
 
 const RAW_PARQUET_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const FIRST_PARQUET_PART_INDEX: u32 = 1;
-const RAW_PARTITION_EXCHANGE: &str = "binance";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawParquetPartEntry {
@@ -58,7 +57,7 @@ pub async fn run_raw_spooler(
     let mut writer = RawBookTickerParquetWriter::new(
         config.raw_spool_dir.clone(),
         config.raw_parquet_chunk_rows,
-        RAW_PARTITION_EXCHANGE.to_string(),
+        config.exchange.clone(),
         config.stream_symbol.clone(),
     );
 

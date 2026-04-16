@@ -7,18 +7,17 @@ use reqwest::Client;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::binance::fetch_depth_snapshot;
-use crate::config::AppConfig;
+use crate::connectors::fetch_depth_snapshot;
+use crate::config::{AppConfig, ContractType};
 use crate::telemetry::TelemetryEvent;
 use crate::types::{
-    CancelHeuristic, DepthEvent, DepthSnapshot, DepthUpdate, OrderbookSnapshotEvent,
+    CancelHeuristic, DepthEvent, DepthSnapshot, NormalizedDepthUpdate, OrderbookSnapshotEvent,
     SignalMetric, UnifiedEvent, VolumeChunk, now_utc_ms,
 };
 
 const OFI_PRICE_EPSILON: f64 = 1e-9;
 const LEVEL_QTY_EPSILON: f64 = 1e-9;
 const MOFI_SIGN_EPSILON: f64 = 1e-6;
-const COIN_M_CONTRACT_NOTIONAL_USD: f64 = 100.0;
 const MOFI_DEPTH_LEVELS: usize = 5;
 const REORDER_HOLD_WINDOW_MS: i64 = 20;
 const REORDER_MAX_BUFFERED_EVENTS: usize = 50_000;
@@ -304,14 +303,20 @@ pub struct LocalOrderBook {
     bids: BTreeMap<OrderedFloat<f64>, LevelState>,
     asks: BTreeMap<OrderedFloat<f64>, LevelState>,
     cancel_heuristic: CancelHeuristic,
+    contract_type: ContractType,
 }
 
 impl LocalOrderBook {
-    pub fn from_snapshot(snapshot: &DepthSnapshot, cancel_heuristic: CancelHeuristic) -> Self {
+    pub fn from_snapshot(
+        snapshot: &DepthSnapshot,
+        cancel_heuristic: CancelHeuristic,
+        contract_type: ContractType,
+    ) -> Self {
         let mut book = Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             cancel_heuristic,
+            contract_type,
         };
         book.load_snapshot(snapshot);
         book
@@ -337,7 +342,7 @@ impl LocalOrderBook {
     }
 
     #[allow(dead_code)]
-    pub fn apply_depth_update(&mut self, update: &DepthUpdate) -> Result<()> {
+    pub fn apply_depth_update(&mut self, update: &NormalizedDepthUpdate) -> Result<()> {
         let empty_bid_plan = DecreasePlan::new();
         let empty_ask_plan = DecreasePlan::new();
         self.apply_depth_update_with_plans(update, &empty_bid_plan, &empty_ask_plan)
@@ -345,7 +350,7 @@ impl LocalOrderBook {
 
     fn apply_depth_update_with_plans(
         &mut self,
-        update: &DepthUpdate,
+        update: &NormalizedDepthUpdate,
         bid_decrease_plan: &DecreasePlan,
         ask_decrease_plan: &DecreasePlan,
     ) -> Result<()> {
@@ -381,7 +386,7 @@ impl LocalOrderBook {
 
     fn build_decrease_plans(
         &self,
-        update: &DepthUpdate,
+        update: &NormalizedDepthUpdate,
         trade_matcher: &mut AggTradeMatcher,
     ) -> Result<(DecreasePlan, DecreasePlan)> {
         let bid_decrease_plan = build_side_decrease_plan(
@@ -454,7 +459,9 @@ impl LocalOrderBook {
             if price < min_price {
                 break;
             }
-            total += COIN_M_CONTRACT_NOTIONAL_USD * level_state.total_qty;
+            total += self
+                .contract_type
+                .quote_notional(price, level_state.total_qty);
         }
         total
     }
@@ -466,7 +473,9 @@ impl LocalOrderBook {
             if price > max_price {
                 break;
             }
-            total += COIN_M_CONTRACT_NOTIONAL_USD * level_state.total_qty;
+            total += self
+                .contract_type
+                .quote_notional(price, level_state.total_qty);
         }
         total
     }
@@ -846,9 +855,13 @@ struct EngineState {
 }
 
 impl EngineState {
-    fn new(snapshot: &DepthSnapshot, cancel_heuristic: CancelHeuristic) -> Self {
+    fn new(
+        snapshot: &DepthSnapshot,
+        cancel_heuristic: CancelHeuristic,
+        contract_type: ContractType,
+    ) -> Self {
         Self {
-            orderbook: LocalOrderBook::from_snapshot(snapshot, cancel_heuristic),
+            orderbook: LocalOrderBook::from_snapshot(snapshot, cancel_heuristic, contract_type),
             trade_matcher: AggTradeMatcher::new(AGGTRADE_MATCH_WINDOW_MS),
             cvd_tracker: CvdTracker::new(),
             spoof_threshold_tracker: SpoofThresholdTracker::new(SPOOF_THRESHOLD_WINDOW_MS),
@@ -1230,7 +1243,7 @@ pub async fn run_engine(
 ) -> Result<()> {
     let http_client = Client::new();
     let snapshot = fetch_snapshot_with_retry(&config, &http_client).await?;
-    let mut engine = EngineState::new(&snapshot, config.cancel_heuristic);
+    let mut engine = EngineState::new(&snapshot, config.cancel_heuristic, config.contract_type);
 
     let bootstrap_snapshot_ts_ms = now_utc_ms();
     emit_snapshot_event(
@@ -1239,6 +1252,7 @@ pub async fn run_engine(
             &snapshot,
             bootstrap_snapshot_ts_ms,
             SNAPSHOT_SOURCE_REST_BOOTSTRAP,
+            &config,
         ),
     )
     .await;
@@ -1318,6 +1332,7 @@ pub async fn run_engine(
                     &snapshot,
                     resync_snapshot_ts_ms,
                     SNAPSHOT_SOURCE_REST_RESYNC,
+                    &config,
                 ),
             )
             .await;
@@ -1394,6 +1409,7 @@ async fn process_unified_event(
                         metrics_tx,
                         signal_tx,
                         telemetry_tx,
+                        config,
                         config.symbol.as_str(),
                     )
                     .await;
@@ -1404,7 +1420,7 @@ async fn process_unified_event(
 
                     maybe_emit_local_keyframe_snapshot(
                         engine,
-                        config.symbol.as_str(),
+                        config,
                         event.payload.event_time_ms,
                         snapshot_dump_interval_ms,
                         next_snapshot_dump_ts_ms,
@@ -1452,6 +1468,7 @@ async fn process_unified_event(
                         metrics_tx,
                         signal_tx,
                         telemetry_tx,
+                        config,
                         config.symbol.as_str(),
                     )
                     .await;
@@ -1464,6 +1481,7 @@ async fn process_unified_event(
                             &snapshot,
                             resync_snapshot_ts_ms,
                             SNAPSHOT_SOURCE_REST_RESYNC,
+                            config,
                         ),
                     )
                     .await;
@@ -1500,11 +1518,12 @@ fn build_snapshot_event_from_snapshot(
     snapshot: &DepthSnapshot,
     snapshot_ts_ms: i64,
     source: &str,
+    config: &AppConfig,
 ) -> OrderbookSnapshotEvent {
     OrderbookSnapshotEvent {
         schema_version: 1,
-        exchange: "binance".to_string(),
-        market: "coin-m-futures".to_string(),
+        exchange: config.exchange.clone(),
+        market: config.market.clone(),
         symbol: snapshot.symbol.clone(),
         snapshot_ts_ms,
         last_update_id: snapshot.last_update_id,
@@ -1519,12 +1538,13 @@ fn build_snapshot_event_from_local_orderbook(
     symbol: &str,
     last_update_id: u64,
     snapshot_ts_ms: i64,
+    config: &AppConfig,
 ) -> OrderbookSnapshotEvent {
     let (bids, asks) = orderbook.full_levels();
     OrderbookSnapshotEvent {
         schema_version: 1,
-        exchange: "binance".to_string(),
-        market: "coin-m-futures".to_string(),
+        exchange: config.exchange.clone(),
+        market: config.market.clone(),
         symbol: symbol.to_string(),
         snapshot_ts_ms,
         last_update_id,
@@ -1545,7 +1565,7 @@ async fn emit_snapshot_event(
 
 async fn maybe_emit_local_keyframe_snapshot(
     engine: &EngineState,
-    symbol: &str,
+    config: &AppConfig,
     event_ts_ms: i64,
     snapshot_dump_interval_ms: Option<i64>,
     next_snapshot_dump_ts_ms: &mut Option<i64>,
@@ -1567,9 +1587,10 @@ async fn maybe_emit_local_keyframe_snapshot(
         snapshot_tx,
         build_snapshot_event_from_local_orderbook(
             &engine.orderbook,
-            symbol,
+            config.symbol.as_str(),
             engine.last_update_id,
             event_ts_ms,
+            config,
         ),
     )
     .await;
@@ -1813,6 +1834,7 @@ fn build_signal_metric(
     cvd_5s: f64,
     cvd_1m: f64,
     cvd_5m: f64,
+    config: &AppConfig,
     symbol: &str,
 ) -> Option<SignalMetric> {
     let (best_bid, best_bid_qty) = orderbook.best_bid()?;
@@ -1858,10 +1880,10 @@ fn build_signal_metric(
 
     Some(SignalMetric {
         schema_version: 1,
-        exchange: "binance".to_string(),
-        market: "coin-m-futures".to_string(),
+        exchange: config.exchange.clone(),
+        market: config.market.clone(),
         symbol: symbol.to_string(),
-        event_id: format!("binance:coin-m-futures:{}:{}", symbol, event.payload.final_update_id),
+        event_id: config.depth_event_id(symbol, event.payload.final_update_id),
         event_ts_ms: event.payload.event_time_ms,
         recv_ts_ms: event.recv_ts_ms,
         stale_state,
@@ -1907,6 +1929,7 @@ async fn emit_metric(
     metrics_tx: &mpsc::Sender<SignalMetric>,
     signal_tx: &broadcast::Sender<SignalMetric>,
     telemetry_tx: &mpsc::Sender<TelemetryEvent>,
+    config: &AppConfig,
     symbol: &str,
 ) {
     let current_levels = orderbook.top_levels(MOFI_DEPTH_LEVELS);
@@ -1924,6 +1947,7 @@ async fn emit_metric(
         cvd_5s,
         cvd_1m,
         cvd_5m,
+        config,
         symbol,
     ) else {
         return;
@@ -2064,7 +2088,10 @@ async fn fetch_snapshot_with_retry(config: &AppConfig, http_client: &Client) -> 
 mod tests {
     use std::time::Instant;
 
-    use crate::types::{AggTrade, AggTradeEvent, CancelHeuristic, DepthUpdate, UnifiedEvent};
+    use crate::config::ContractType;
+    use crate::types::{
+        AggTradeEvent, CancelHeuristic, NormalizedAggTrade, NormalizedDepthUpdate, UnifiedEvent,
+    };
 
     use super::{
         AggTradeMatcher, BookSide, compute_l1_ofi, compute_m_ofi, DepthEvent, DepthSnapshot,
@@ -2089,7 +2116,7 @@ mod tests {
         asks: Vec<[&str; 2]>,
     ) -> DepthEvent {
         DepthEvent {
-            payload: DepthUpdate {
+            payload: NormalizedDepthUpdate {
                 event_type: "depthUpdate".to_string(),
                 event_time_ms: final_update_id as i64,
                 transaction_time_ms: Some(final_update_id as i64),
@@ -2114,7 +2141,7 @@ mod tests {
 
     fn test_agg_trade_event(event_ts_ms: i64) -> AggTradeEvent {
         AggTradeEvent {
-            payload: AggTrade {
+            payload: NormalizedAggTrade {
                 event_type: "aggTrade".to_string(),
                 event_time_ms: event_ts_ms,
                 trade_time_ms: event_ts_ms,
@@ -2149,7 +2176,11 @@ mod tests {
 
     #[test]
     fn fault_injection_missed_bridge_requires_resync() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         let event = test_event(105, 106, 104, vec![["100.0", "1.0"]], vec![]);
 
         let outcome = state.process_depth_event(&event, 0.0);
@@ -2166,7 +2197,11 @@ mod tests {
 
     #[test]
     fn fault_injection_out_of_order_update_is_ignored() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         sync_engine(&mut state);
 
         let out_of_order = test_event(100, 101, 100, vec![["99.0", "1.2"]], vec![]);
@@ -2179,7 +2214,11 @@ mod tests {
 
     #[test]
     fn fault_injection_disconnect_gap_triggers_resync() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         sync_engine(&mut state);
 
         let gap_event = test_event(102, 103, 99, vec![["100.0", "3.0"]], vec![]);
@@ -2197,7 +2236,11 @@ mod tests {
 
     #[test]
     fn fault_injection_snapshot_mismatch_triggers_resync() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         sync_engine(&mut state);
 
         let crossed_book_event = test_event(102, 102, 101, vec![["102.5", "1.0"]], vec![]);
@@ -2215,7 +2258,11 @@ mod tests {
 
     #[test]
     fn replace_snapshot_resets_sync_state() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         sync_engine(&mut state);
 
         let replacement = DepthSnapshot {
@@ -2352,8 +2399,12 @@ mod tests {
             asks,
         };
 
-        let mut book = LocalOrderBook::from_snapshot(&snapshot, CancelHeuristic::Lifo);
-        let update = DepthUpdate {
+        let mut book = LocalOrderBook::from_snapshot(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
+        let update = NormalizedDepthUpdate {
             event_type: "depthUpdate".to_string(),
             event_time_ms: 123,
             transaction_time_ms: Some(123),
@@ -2387,8 +2438,12 @@ mod tests {
             asks: vec![(101.0, 2.0)],
         };
 
-        let mut book = LocalOrderBook::from_snapshot(&snapshot, CancelHeuristic::Lifo);
-        let increase_update = DepthUpdate {
+        let mut book = LocalOrderBook::from_snapshot(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
+        let increase_update = NormalizedDepthUpdate {
             event_type: "depthUpdate".to_string(),
             event_time_ms: 1000,
             transaction_time_ms: Some(1000),
@@ -2405,7 +2460,7 @@ mod tests {
         let mut matcher = AggTradeMatcher::new(100);
         matcher.record_trade(BookSide::Bid, 100.0, 2.0, 1040);
 
-        let decrease_update = DepthUpdate {
+        let decrease_update = NormalizedDepthUpdate {
             event_type: "depthUpdate".to_string(),
             event_time_ms: 1050,
             transaction_time_ms: Some(1050),
@@ -2455,10 +2510,33 @@ mod tests {
             asks: vec![(101.0, 1.0), (102.0, 4.0)],
         };
 
-        let book = LocalOrderBook::from_snapshot(&snapshot, CancelHeuristic::Lifo);
+        let book = LocalOrderBook::from_snapshot(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
 
         assert!((book.bid_notional_in_band(95.0) - 500.0).abs() < 1e-9);
         assert!((book.ask_notional_in_band(200.0) - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn linear_notional_uses_price_times_quantity() {
+        let snapshot = DepthSnapshot {
+            symbol: "BTCUSDT".to_string(),
+            last_update_id: 1,
+            bids: vec![(100.0, 2.0), (99.0, 3.0)],
+            asks: vec![(101.0, 1.0), (102.0, 4.0)],
+        };
+
+        let book = LocalOrderBook::from_snapshot(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Linear,
+        );
+
+        assert!((book.bid_notional_in_band(95.0) - 497.0).abs() < 1e-9);
+        assert!((book.ask_notional_in_band(200.0) - 509.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2487,7 +2565,11 @@ mod tests {
 
     #[test]
     fn spoof_sequence_trigger_fires_on_wall_pull_with_opposite_sweep() {
-        let mut state = EngineState::new(&test_snapshot(100), CancelHeuristic::Lifo);
+        let mut state = EngineState::new(
+            &test_snapshot(100),
+            CancelHeuristic::Lifo,
+            ContractType::Inverse { contract_size: 100.0 },
+        );
         sync_engine(&mut state);
 
         for update_id in 102..=107 {

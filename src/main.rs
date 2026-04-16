@@ -1,5 +1,5 @@
-mod binance;
 mod clock;
+mod connectors;
 mod config;
 mod health;
 mod orderbook;

@@ -12,6 +12,8 @@ pub async fn run_health_reporter(config: AppConfig) -> Result<()> {
         ticker.tick().await;
 
         info!(
+            exchange = %config.exchange,
+            market = %config.market,
             canonical_symbol = %config.canonical_symbol,
             exchange_symbol = %config.symbol,
             depth_stream_enabled = config.enable_depth_stream,

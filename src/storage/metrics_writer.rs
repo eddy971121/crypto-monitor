@@ -102,7 +102,12 @@ async fn run_file_metrics_writer(
     telemetry_tx: mpsc::Sender<TelemetryEvent>,
 ) -> Result<()> {
     info!("metrics backend selected: jsonl");
-    let mut writer = MetricsFileWriter::new(config.metrics_dir.clone());
+    let mut writer = MetricsFileWriter::new(
+        config.metrics_dir.clone(),
+        config.exchange.clone(),
+        config.market.clone(),
+        config.stream_symbol.clone(),
+    );
 
     while let Some(metric) = metrics_rx.recv().await {
         if let Err(error) = writer.write_metric(&metric).await {
@@ -517,14 +522,20 @@ impl RecentEventCache {
 
 struct MetricsFileWriter {
     metrics_dir: PathBuf,
+    exchange: String,
+    market: String,
+    stream_symbol: String,
     current_date: Option<String>,
     file: Option<tokio::fs::File>,
 }
 
 impl MetricsFileWriter {
-    fn new(metrics_dir: PathBuf) -> Self {
+    fn new(metrics_dir: PathBuf, exchange: String, market: String, stream_symbol: String) -> Self {
         Self {
             metrics_dir,
+            exchange,
+            market,
+            stream_symbol,
             current_date: None,
             file: None,
         }
@@ -554,7 +565,13 @@ impl MetricsFileWriter {
             .await
             .with_context(|| format!("failed to create {}", self.metrics_dir.display()))?;
 
-        let file_path = metrics_file_path(&self.metrics_dir, date_key);
+        let file_path = metrics_file_path(
+            &self.metrics_dir,
+            date_key,
+            self.exchange.as_str(),
+            self.market.as_str(),
+            self.stream_symbol.as_str(),
+        );
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -583,6 +600,48 @@ fn date_key_from_ts(ts_ms: i64) -> String {
     }
 }
 
-pub fn metrics_file_path(metrics_dir: &Path, date_key: &str) -> PathBuf {
+pub fn metrics_file_path(
+    metrics_dir: &Path,
+    date_key: &str,
+    exchange: &str,
+    market: &str,
+    stream_symbol: &str,
+) -> PathBuf {
+    metrics_dir.join(format!(
+        "metrics-{}-{}-{}-{}.jsonl",
+        exchange, market, stream_symbol, date_key
+    ))
+}
+
+pub fn legacy_metrics_file_path(metrics_dir: &Path, date_key: &str) -> PathBuf {
     metrics_dir.join(format!("metrics-{}.jsonl", date_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{legacy_metrics_file_path, metrics_file_path};
+
+    #[test]
+    fn metrics_file_path_embeds_exchange_market_symbol_and_date() {
+        let path = metrics_file_path(
+            Path::new("data/metrics"),
+            "2026-04-16",
+            "binance",
+            "usdm",
+            "btcusdt",
+        );
+
+        assert_eq!(
+            path,
+            Path::new("data/metrics/metrics-binance-usdm-btcusdt-2026-04-16.jsonl")
+        );
+    }
+
+    #[test]
+    fn legacy_metrics_file_path_keeps_previous_pattern() {
+        let path = legacy_metrics_file_path(Path::new("data/metrics"), "2026-04-16");
+        assert_eq!(path, Path::new("data/metrics/metrics-2026-04-16.jsonl"));
+    }
 }

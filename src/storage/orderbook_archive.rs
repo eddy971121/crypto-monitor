@@ -23,7 +23,6 @@ use crate::types::{DepthEvent, OrderbookSnapshotEvent};
 
 const DEPTH_DATASET_PREFIX: &str = "depth-delta";
 const SNAPSHOT_DATASET_PREFIX: &str = "snapshot";
-const ORDERBOOK_PARTITION_EXCHANGE: &str = "binance";
 
 pub async fn run_orderbook_archive_spooler(
     config: AppConfig,
@@ -34,12 +33,14 @@ pub async fn run_orderbook_archive_spooler(
     let mut depth_writer = DepthDeltaParquetWriter::new(
         config.raw_spool_dir.clone(),
         config.raw_parquet_chunk_rows,
-        ORDERBOOK_PARTITION_EXCHANGE.to_string(),
+        config.exchange.clone(),
         config.stream_symbol.clone(),
+        config.exchange.clone(),
+        config.market.clone(),
     );
     let mut snapshot_writer = SnapshotParquetWriter::new(
         config.raw_spool_dir.clone(),
-        ORDERBOOK_PARTITION_EXCHANGE.to_string(),
+        config.exchange.clone(),
         config.stream_symbol.clone(),
     );
 
@@ -96,6 +97,8 @@ struct DepthDeltaParquetWriter {
     chunk_rows: usize,
     partition_exchange: String,
     partition_symbol: String,
+    row_exchange: String,
+    row_market: String,
     active_date: Option<String>,
     manifest: Option<RawParquetManifest>,
     recv_ts_ms: Vec<i64>,
@@ -117,6 +120,8 @@ impl DepthDeltaParquetWriter {
         chunk_rows: usize,
         partition_exchange: String,
         partition_symbol: String,
+        row_exchange: String,
+        row_market: String,
     ) -> Self {
         let capacity = chunk_rows.max(1);
         Self {
@@ -124,6 +129,8 @@ impl DepthDeltaParquetWriter {
             chunk_rows: capacity,
             partition_exchange,
             partition_symbol,
+            row_exchange,
+            row_market,
             active_date: None,
             manifest: None,
             recv_ts_ms: Vec::with_capacity(capacity),
@@ -176,8 +183,8 @@ impl DepthDeltaParquetWriter {
 
             self.recv_ts_ms.push(event.recv_ts_ms);
             self.event_ts_ms.push(event.payload.event_time_ms);
-            self.exchange.push("binance".to_string());
-            self.market.push("coin-m-futures".to_string());
+            self.exchange.push(self.row_exchange.clone());
+            self.market.push(self.row_market.clone());
             self.symbols.push(event.payload.symbol.clone());
             self.is_bid.push(is_bid);
             self.price.push(price);

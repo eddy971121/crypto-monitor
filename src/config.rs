@@ -10,13 +10,104 @@ pub enum MetricsBackend {
     ClickHouse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContractType {
+    Linear,
+    Inverse { contract_size: f64 },
+}
+
+impl ContractType {
+    pub fn quote_notional(self, price: f64, quantity: f64) -> f64 {
+        if price <= 0.0 || quantity <= 0.0 {
+            return 0.0;
+        }
+
+        match self {
+            Self::Linear => price * quantity,
+            Self::Inverse { contract_size } => quantity * contract_size,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn base_amount(self, price: f64, quantity: f64) -> f64 {
+        if price <= 0.0 || quantity <= 0.0 {
+            return 0.0;
+        }
+
+        match self {
+            Self::Linear => quantity,
+            Self::Inverse { contract_size } => (quantity * contract_size) / price,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MarketType {
+    CoinM,
+    UsdM,
+}
+
+impl MarketType {
+    fn default_symbol(self) -> &'static str {
+        match self {
+            Self::CoinM => "BTCUSD_PERP",
+            Self::UsdM => "BTCUSDT",
+        }
+    }
+
+    fn default_ws_base_url(self) -> &'static str {
+        match self {
+            Self::CoinM => "wss://dstream.binance.com",
+            Self::UsdM => "wss://fstream.binance.com",
+        }
+    }
+
+    fn default_rest_base_url(self) -> &'static str {
+        match self {
+            Self::CoinM => "https://dapi.binance.com",
+            Self::UsdM => "https://fapi.binance.com",
+        }
+    }
+
+    fn default_depth_snapshot_path(self) -> &'static str {
+        match self {
+            Self::CoinM => "/dapi/v1/depth",
+            Self::UsdM => "/fapi/v1/depth",
+        }
+    }
+
+    fn default_market_name(self) -> &'static str {
+        match self {
+            Self::CoinM => "coin-m-futures",
+            Self::UsdM => "usd-m-futures",
+        }
+    }
+
+    fn default_contract_mode(self) -> ContractMode {
+        match self {
+            Self::CoinM => ContractMode::Inverse,
+            Self::UsdM => ContractMode::Linear,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ContractMode {
+    Linear,
+    Inverse,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub exchange: String,
+    pub market: String,
+    pub contract_type: ContractType,
     pub canonical_symbol: String,
     pub symbol: String,
     pub stream_symbol: String,
     pub ws_base_url: String,
     pub rest_base_url: String,
+    pub depth_snapshot_path: String,
     pub depth_limit: u16,
     pub channel_capacity: usize,
     pub enable_depth_stream: bool,
@@ -50,12 +141,55 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        let canonical_symbol = env_or_default("APP_SYMBOL", "BTCUSD_PERP");
-        let (canonical_symbol, symbol, stream_symbol) =
-            resolve_binance_coinm_instrument(&canonical_symbol)?;
+        let exchange = normalize_identity_component(
+            env_or_default("APP_EXCHANGE", "binance"),
+            "APP_EXCHANGE",
+        )?;
+        if exchange != "binance" {
+            return Err(anyhow::anyhow!(
+                "unsupported APP_EXCHANGE value: {exchange}; currently supported: binance"
+            ));
+        }
 
-        let ws_base_url = env_or_default("APP_WS_BASE_URL", "wss://dstream.binance.com");
-        let rest_base_url = env_or_default("APP_REST_BASE_URL", "https://dapi.binance.com");
+        let market_type = parse_market_type(&env_or_default("APP_MARKET", "coinm"))?;
+        let market = normalize_identity_component(
+            env_or_default("APP_MARKET_NAME", market_type.default_market_name()),
+            "APP_MARKET_NAME",
+        )?;
+
+        let canonical_symbol = env_or_default("APP_SYMBOL", market_type.default_symbol());
+        let (canonical_symbol, symbol, stream_symbol) =
+            resolve_binance_instrument(market_type, &canonical_symbol)?;
+
+        let ws_base_url = env_or_default("APP_WS_BASE_URL", market_type.default_ws_base_url());
+        let rest_base_url = env_or_default("APP_REST_BASE_URL", market_type.default_rest_base_url());
+        let depth_snapshot_path = env_or_default(
+            "APP_DEPTH_SNAPSHOT_PATH",
+            market_type.default_depth_snapshot_path(),
+        );
+
+        if !depth_snapshot_path.starts_with('/') {
+            return Err(anyhow::anyhow!(
+                "APP_DEPTH_SNAPSHOT_PATH must start with '/'; got {}",
+                depth_snapshot_path
+            ));
+        }
+
+        let contract_mode = parse_contract_mode(&env_or_default(
+            "APP_CONTRACT_TYPE",
+            contract_mode_name(market_type.default_contract_mode()),
+        ))?;
+        let contract_size = parse_env_or_default("APP_CONTRACT_SIZE", 100.0_f64)?;
+        if contract_size <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "APP_CONTRACT_SIZE must be greater than 0"
+            ));
+        }
+        let contract_type = match contract_mode {
+            ContractMode::Linear => ContractType::Linear,
+            ContractMode::Inverse => ContractType::Inverse { contract_size },
+        };
+
         let depth_limit = parse_env_or_default("APP_DEPTH_LIMIT", 1000_u16)?;
         let channel_capacity = parse_env_or_default("APP_CHANNEL_CAPACITY", 20000_usize)?;
         let enable_depth_stream = parse_env_or_default("APP_ENABLE_DEPTH_STREAM", true)?;
@@ -164,15 +298,20 @@ impl AppConfig {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let s3_prefix = env_or_default("APP_S3_PREFIX", "crypto-monitor/binance-coinm");
+        let default_s3_prefix = format!("crypto-monitor/{}/{}", exchange, market);
+        let s3_prefix = env_or_default("APP_S3_PREFIX", default_s3_prefix.as_str());
         let metrics_retention_days = parse_env_or_default("APP_METRICS_RETENTION_DAYS", 30_i64)?;
 
         Ok(Self {
+            exchange,
+            market,
+            contract_type,
             canonical_symbol,
             symbol,
             stream_symbol,
             ws_base_url,
             rest_base_url,
+            depth_snapshot_path,
             depth_limit,
             channel_capacity,
             enable_depth_stream,
@@ -207,6 +346,13 @@ impl AppConfig {
 
     pub fn symbol_stream_key(&self) -> String {
         self.stream_symbol.clone()
+    }
+
+    pub fn depth_event_id(&self, symbol: &str, final_update_id: u64) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.exchange, self.market, symbol, final_update_id
+        )
     }
 }
 
@@ -249,19 +395,81 @@ fn parse_metrics_backend(value: &str) -> Result<MetricsBackend> {
     }
 }
 
-fn resolve_binance_coinm_instrument(input: &str) -> Result<(String, String, String)> {
+fn resolve_binance_instrument(
+    market_type: MarketType,
+    input: &str,
+) -> Result<(String, String, String)> {
     let normalized = input.trim().to_ascii_uppercase();
 
-    match normalized.as_str() {
-        "BTCUSD_PERP" => Ok((
-            "BTCUSD_PERP".to_string(),
-            "BTCUSD_PERP".to_string(),
-            "btcusd_perp".to_string(),
-        )),
+    match market_type {
+        MarketType::CoinM => match normalized.as_str() {
+            "BTCUSD_PERP" => Ok((
+                "BTCUSD_PERP".to_string(),
+                "BTCUSD_PERP".to_string(),
+                "btcusd_perp".to_string(),
+            )),
+            "ETHUSD_PERP" => Ok((
+                "ETHUSD_PERP".to_string(),
+                "ETHUSD_PERP".to_string(),
+                "ethusd_perp".to_string(),
+            )),
+            other => Err(anyhow::anyhow!(
+                "unsupported APP_SYMBOL for Binance COIN-M: {other}; currently supported: BTCUSD_PERP, ETHUSD_PERP"
+            )),
+        },
+        MarketType::UsdM => match normalized.as_str() {
+            "BTCUSDT" => Ok((
+                "BTCUSDT".to_string(),
+                "BTCUSDT".to_string(),
+                "btcusdt".to_string(),
+            )),
+            "ETHUSDT" => Ok((
+                "ETHUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "ethusdt".to_string(),
+            )),
+            other => Err(anyhow::anyhow!(
+                "unsupported APP_SYMBOL for Binance USD-M: {other}; currently supported: BTCUSDT, ETHUSDT"
+            )),
+        },
+    }
+}
+
+fn parse_market_type(value: &str) -> Result<MarketType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "coinm" | "coin-m" | "coin_m" | "coin-m-futures" => Ok(MarketType::CoinM),
+        "usdm" | "usd-m" | "usd_m" | "usd-m-futures" => Ok(MarketType::UsdM),
         other => Err(anyhow::anyhow!(
-            "unsupported APP_SYMBOL for Binance COIN-M: {other}; currently supported: BTCUSD_PERP"
+            "invalid APP_MARKET value: {other}; expected coinm or usdm"
         )),
     }
+}
+
+fn parse_contract_mode(value: &str) -> Result<ContractMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "linear" => Ok(ContractMode::Linear),
+        "inverse" => Ok(ContractMode::Inverse),
+        other => Err(anyhow::anyhow!(
+            "invalid APP_CONTRACT_TYPE value: {other}; expected linear or inverse"
+        )),
+    }
+}
+
+fn contract_mode_name(mode: ContractMode) -> &'static str {
+    match mode {
+        ContractMode::Linear => "linear",
+        ContractMode::Inverse => "inverse",
+    }
+}
+
+fn normalize_identity_component(value: String, key: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{key} must be non-empty after trimming whitespace"
+        ));
+    }
+    Ok(normalized)
 }
 
 fn parse_cancel_heuristic(value: &str) -> Result<CancelHeuristic> {

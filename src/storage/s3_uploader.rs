@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
-use crate::storage::metrics_writer::metrics_file_path;
+use crate::storage::metrics_writer::{legacy_metrics_file_path, metrics_file_path};
 use crate::storage::orderbook_archive::{
     depth_delta_manifest_file_path, list_depth_delta_parquet_parts, load_depth_delta_manifest,
     load_snapshot_manifest, save_depth_delta_manifest, save_snapshot_manifest,
@@ -27,8 +27,6 @@ use crate::storage::raw_spool::{
 };
 use crate::telemetry::TelemetryEvent;
 use crate::types::RawBookTickerRow;
-
-const PARTITION_EXCHANGE: &str = "binance";
 
 #[derive(Debug, Clone, Copy)]
 struct PartUploadResult {
@@ -118,7 +116,7 @@ async fn process_previous_day_parquet_parts(
     let mut manifest =
         match load_or_rebuild_manifest_for_upload(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         )
@@ -179,7 +177,7 @@ async fn process_previous_day_parquet_parts(
         manifest.parts[index].uploaded = true;
         save_raw_parquet_manifest(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             &manifest,
         )
@@ -202,7 +200,7 @@ async fn process_previous_day_parquet_parts(
     if manifest.all_uploaded() {
         let manifest_path = manifest_file_path(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         );
@@ -233,7 +231,7 @@ async fn process_previous_day_depth_delta_parts(
     let mut manifest =
         match load_or_rebuild_depth_delta_manifest_for_upload(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         )
@@ -294,7 +292,7 @@ async fn process_previous_day_depth_delta_parts(
         manifest.parts[index].uploaded = true;
         save_depth_delta_manifest(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             &manifest,
         )
@@ -317,7 +315,7 @@ async fn process_previous_day_depth_delta_parts(
     if manifest.all_uploaded() {
         let manifest_path = depth_delta_manifest_file_path(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         );
@@ -348,7 +346,7 @@ async fn process_previous_day_snapshot_parts(
     let mut manifest =
         match load_or_rebuild_snapshot_manifest_for_upload(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         )
@@ -409,7 +407,7 @@ async fn process_previous_day_snapshot_parts(
         manifest.parts[index].uploaded = true;
         save_snapshot_manifest(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             &manifest,
         )
@@ -432,7 +430,7 @@ async fn process_previous_day_snapshot_parts(
     if manifest.all_uploaded() {
         let manifest_path = snapshot_manifest_file_path(
             &config.raw_spool_dir,
-            PARTITION_EXCHANGE,
+            config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
         );
@@ -605,7 +603,7 @@ fn object_key_for_part(config: &AppConfig, date_key: &str, file_name: &str) -> S
     format!(
         "{}/exchange={}/symbol={}/date={}/{}",
         config.s3_prefix,
-        PARTITION_EXCHANGE,
+        config.exchange.as_str(),
         config.stream_symbol,
         date_key,
         relative,
@@ -613,10 +611,22 @@ fn object_key_for_part(config: &AppConfig, date_key: &str, file_name: &str) -> S
 }
 
 async fn process_previous_day_metrics_file(config: &AppConfig, date_key: &str) -> Result<usize> {
-    let metrics_path = metrics_file_path(&config.metrics_dir, date_key);
-    if !path_exists(&metrics_path).await {
+    let per_pair_metrics_path = metrics_file_path(
+        &config.metrics_dir,
+        date_key,
+        config.exchange.as_str(),
+        config.market.as_str(),
+        config.stream_symbol.as_str(),
+    );
+    let legacy_metrics_path = legacy_metrics_file_path(&config.metrics_dir, date_key);
+
+    let metrics_path = if path_exists(&per_pair_metrics_path).await {
+        per_pair_metrics_path
+    } else if path_exists(&legacy_metrics_path).await {
+        legacy_metrics_path
+    } else {
         return Ok(0);
-    }
+    };
 
     let Some(bucket) = &config.s3_bucket else {
         warn!("APP_S3_BUCKET is not set; keeping local metrics file until bucket is configured");
@@ -626,7 +636,7 @@ async fn process_previous_day_metrics_file(config: &AppConfig, date_key: &str) -
     let object_key = format!(
         "{}/exchange={}/symbol={}/date={}/metrics/metrics-{}.jsonl",
         config.s3_prefix,
-        PARTITION_EXCHANGE,
+        config.exchange.as_str(),
         config.stream_symbol,
         date_key,
         date_key,
@@ -656,7 +666,7 @@ async fn process_previous_day_legacy_jsonl(
 ) -> Result<usize> {
     let raw_path = raw_file_path(
         &config.raw_spool_dir,
-        PARTITION_EXCHANGE,
+        config.exchange.as_str(),
         config.stream_symbol.as_str(),
         date_key,
     );
@@ -666,7 +676,7 @@ async fn process_previous_day_legacy_jsonl(
 
     let parquet_path = parquet_file_path(
         &config.raw_spool_dir,
-        PARTITION_EXCHANGE,
+        config.exchange.as_str(),
         config.stream_symbol.as_str(),
         date_key,
     );
@@ -691,7 +701,7 @@ async fn process_previous_day_legacy_jsonl(
     let object_key = format!(
         "{}/exchange={}/symbol={}/date={}/bookticker.parquet",
         config.s3_prefix,
-        PARTITION_EXCHANGE,
+        config.exchange.as_str(),
         config.stream_symbol,
         date_key,
     );
@@ -793,7 +803,12 @@ fn parse_metrics_date(file_name: &str) -> Option<NaiveDate> {
         return None;
     }
 
-    let date_part = file_name.strip_prefix("metrics-")?.strip_suffix(".jsonl")?;
+    let stem = file_name.strip_prefix("metrics-")?.strip_suffix(".jsonl")?;
+    if stem.len() < 10 {
+        return None;
+    }
+
+    let date_part = &stem[stem.len() - 10..];
 
     NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
 }
@@ -916,7 +931,9 @@ fn parse_raw_rows_from_line(line: &str) -> Result<Vec<RawBookTickerRow>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_raw_rows_from_line;
+    use chrono::NaiveDate;
+
+    use super::{parse_metrics_date, parse_raw_rows_from_line};
 
     #[test]
     fn parse_raw_rows_from_line_handles_concatenated_json_objects() {
@@ -936,5 +953,16 @@ mod tests {
     fn parse_raw_rows_from_line_rejects_non_json_content() {
         let error = parse_raw_rows_from_line("not-json").expect_err("expected parse failure");
         assert!(error.to_string().contains("failed to decode raw row"));
+    }
+
+    #[test]
+    fn parse_metrics_date_supports_legacy_and_per_pair_names() {
+        let legacy = parse_metrics_date("metrics-2026-04-16.jsonl")
+            .expect("legacy metrics filename should parse");
+        assert_eq!(legacy, NaiveDate::from_ymd_opt(2026, 4, 16).expect("valid date"));
+
+        let per_pair = parse_metrics_date("metrics-binance-usdm-btcusdt-2026-04-16.jsonl")
+            .expect("per-pair metrics filename should parse");
+        assert_eq!(per_pair, NaiveDate::from_ymd_opt(2026, 4, 16).expect("valid date"));
     }
 }
