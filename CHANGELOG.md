@@ -21,7 +21,7 @@ The format is based on Keep a Changelog.
 - Daily S3 uploader with object size verification and post-upload local cleanup.
 - Local retention pruning for metrics files.
 - Environment template in .env.example.
-- Planning document at docs/PLAN_AND_MILESTONES.md.
+- Planning and implementation milestone document at docs/IMPLEMENTATION_MILESTONE_CHECKLIST.md.
 - Runtime telemetry aggregator for p99 ingest-to-signal latency and loss-rate monitoring.
 - SLO warning logs for p99 latency and depth-gap loss-rate threshold breaches.
 - Runtime counters for sequence gaps, resync cycles, parser errors, write errors, and S3 upload outcomes.
@@ -37,7 +37,7 @@ The format is based on Keep a Changelog.
 - Operations runbook covering startup, stale-state, recovery, and upload/backend failures.
 - Fault-injection unit tests for missed bridge, sequence gap, out-of-order, and crossed-book mismatch paths.
 - Soak gate harness script at scripts/run_soak_gate.ps1 with JSON and Markdown pass/fail reports.
-- M7 release gate checklist document at docs/RELEASE_GATE_CHECKLIST.md.
+- Multi-market implementation and soak gate tracking checklist at docs/IMPLEMENTATION_MILESTONE_CHECKLIST_MULTI_MARKET.md.
 - Short soak dry-run validation of gate-report generation workflow.
 - Soak gate script now supports Ctrl+C interruption with graceful child stop and report finalization.
 - Added scripts/get_soak_status.ps1 for live soak telemetry and report-state inspection.

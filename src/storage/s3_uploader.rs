@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,92 @@ use crate::types::RawBookTickerRow;
 struct PartUploadResult {
     found_parts: bool,
     uploaded_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DatasetKind {
+    BookTicker,
+    DepthDelta,
+    Snapshot,
+}
+
+impl DatasetKind {
+    fn no_bucket_warning(self) -> &'static str {
+        match self {
+            Self::BookTicker => {
+                "APP_S3_BUCKET is not set; keeping local parquet spool parts until bucket is configured"
+            }
+            Self::DepthDelta => {
+                "APP_S3_BUCKET is not set; keeping local depth-delta parquet spool parts until bucket is configured"
+            }
+            Self::Snapshot => {
+                "APP_S3_BUCKET is not set; keeping local snapshot parquet spool parts until bucket is configured"
+            }
+        }
+    }
+
+    fn uploaded_cleanup_warning(self) -> &'static str {
+        match self {
+            Self::BookTicker => "failed to cleanup uploaded local parquet part",
+            Self::DepthDelta => "failed to cleanup uploaded local depth-delta parquet part",
+            Self::Snapshot => "failed to cleanup uploaded local snapshot parquet part",
+        }
+    }
+
+    fn post_upload_cleanup_warning(self) -> &'static str {
+        match self {
+            Self::BookTicker => "uploaded parquet part but local cleanup failed",
+            Self::DepthDelta => "uploaded depth-delta parquet part but local cleanup failed",
+            Self::Snapshot => "uploaded snapshot parquet part but local cleanup failed",
+        }
+    }
+
+    fn uploaded_part_info(self) -> &'static str {
+        match self {
+            Self::BookTicker => "uploaded raw bookTicker parquet part",
+            Self::DepthDelta => "uploaded raw depth-delta parquet part",
+            Self::Snapshot => "uploaded raw snapshot parquet part",
+        }
+    }
+
+    fn all_uploaded_info(self) -> &'static str {
+        match self {
+            Self::BookTicker => "uploaded all raw bookTicker parquet parts for day",
+            Self::DepthDelta => "uploaded all raw depth-delta parquet parts for day",
+            Self::Snapshot => "uploaded all raw snapshot parquet parts for day",
+        }
+    }
+
+    fn orphaned_parts_warning(self) -> &'static str {
+        match self {
+            Self::BookTicker => {
+                "detected orphaned raw bookTicker parquet parts; appending to manifest upload queue"
+            }
+            Self::DepthDelta => {
+                "detected orphaned raw depth-delta parquet parts; appending to manifest upload queue"
+            }
+            Self::Snapshot => {
+                "detected orphaned raw snapshot parquet parts; appending to manifest upload queue"
+            }
+        }
+    }
+
+    fn missing_part_error(self, part_path: &Path) -> anyhow::Error {
+        match self {
+            Self::BookTicker => anyhow::anyhow!(
+                "raw parquet manifest references missing part file {}",
+                part_path.display()
+            ),
+            Self::DepthDelta => anyhow::anyhow!(
+                "depth-delta parquet manifest references missing part file {}",
+                part_path.display()
+            ),
+            Self::Snapshot => anyhow::anyhow!(
+                "snapshot parquet manifest references missing part file {}",
+                part_path.display()
+            ),
+        }
+    }
 }
 
 pub async fn run_daily_maintenance(
@@ -84,13 +170,28 @@ async fn process_for_date(
 
     let mut uploaded_rows = 0_usize;
 
-    let book_ticker_upload_result = process_previous_day_parquet_parts(config, date_key.as_str()).await?;
+    let book_ticker_upload_result = process_previous_day_dataset_parts(
+        config,
+        date_key.as_str(),
+        DatasetKind::BookTicker,
+    )
+    .await?;
     uploaded_rows = uploaded_rows.saturating_add(book_ticker_upload_result.uploaded_rows);
 
-    let depth_delta_upload_result = process_previous_day_depth_delta_parts(config, date_key.as_str()).await?;
+    let depth_delta_upload_result = process_previous_day_dataset_parts(
+        config,
+        date_key.as_str(),
+        DatasetKind::DepthDelta,
+    )
+    .await?;
     uploaded_rows = uploaded_rows.saturating_add(depth_delta_upload_result.uploaded_rows);
 
-    let snapshot_upload_result = process_previous_day_snapshot_parts(config, date_key.as_str()).await?;
+    let snapshot_upload_result = process_previous_day_dataset_parts(
+        config,
+        date_key.as_str(),
+        DatasetKind::Snapshot,
+    )
+    .await?;
     uploaded_rows = uploaded_rows.saturating_add(snapshot_upload_result.uploaded_rows);
 
     if !book_ticker_upload_result.found_parts {
@@ -109,27 +210,28 @@ async fn process_for_date(
     Ok(())
 }
 
-async fn process_previous_day_parquet_parts(
+async fn process_previous_day_dataset_parts(
     config: &AppConfig,
     date_key: &str,
+    dataset: DatasetKind,
 ) -> Result<PartUploadResult> {
-    let mut manifest =
-        match load_or_rebuild_manifest_for_upload(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            date_key,
-        )
-        .await?
-        {
-            Some(manifest) => manifest,
-            None => {
-                return Ok(PartUploadResult {
-                    found_parts: false,
-                    uploaded_rows: 0,
-                });
-            }
-        };
+    let mut manifest = match load_or_rebuild_manifest_for_dataset(
+        &config.raw_spool_dir,
+        config.exchange.as_str(),
+        config.stream_symbol.as_str(),
+        date_key,
+        dataset,
+    )
+    .await?
+    {
+        Some(manifest) => manifest,
+        None => {
+            return Ok(PartUploadResult {
+                found_parts: false,
+                uploaded_rows: 0,
+            });
+        }
+    };
 
     if manifest.parts.is_empty() {
         return Ok(PartUploadResult {
@@ -141,7 +243,7 @@ async fn process_previous_day_parquet_parts(
     manifest.parts.sort_by_key(|part| part.part_index);
 
     let Some(bucket) = &config.s3_bucket else {
-        warn!("APP_S3_BUCKET is not set; keeping local parquet spool parts until bucket is configured");
+        warn!("{}", dataset.no_bucket_warning());
         return Ok(PartUploadResult {
             found_parts: true,
             uploaded_rows: 0,
@@ -157,17 +259,19 @@ async fn process_previous_day_parquet_parts(
         if part.uploaded {
             if path_exists(&part_path).await {
                 if let Err(error) = fs::remove_file(&part_path).await {
-                    warn!(%error, path = %part_path.display(), "failed to cleanup uploaded local parquet part");
+                    warn!(
+                        %error,
+                        path = %part_path.display(),
+                        "{}",
+                        dataset.uploaded_cleanup_warning()
+                    );
                 }
             }
             continue;
         }
 
         if !path_exists(&part_path).await {
-            return Err(anyhow::anyhow!(
-                "raw parquet manifest references missing part file {}",
-                part_path.display()
-            ));
+            return Err(dataset.missing_part_error(&part_path));
         }
 
         let object_key = object_key_for_part(config, date_key, part.file_name.as_str());
@@ -175,16 +279,22 @@ async fn process_previous_day_parquet_parts(
         upload_and_verify(bucket, object_key.as_str(), &part_path).await?;
 
         manifest.parts[index].uploaded = true;
-        save_raw_parquet_manifest(
+        save_manifest_for_dataset(
             &config.raw_spool_dir,
             config.exchange.as_str(),
             config.stream_symbol.as_str(),
+            dataset,
             &manifest,
         )
         .await?;
 
         if let Err(error) = fs::remove_file(&part_path).await {
-            warn!(%error, path = %part_path.display(), "uploaded parquet part but local cleanup failed");
+            warn!(
+                %error,
+                path = %part_path.display(),
+                "{}",
+                dataset.post_upload_cleanup_warning()
+            );
         }
 
         uploaded_rows = uploaded_rows.saturating_add(part.row_count);
@@ -193,29 +303,31 @@ async fn process_previous_day_parquet_parts(
             bucket,
             key = %object_key,
             rows = part.row_count,
-            "uploaded raw bookTicker parquet part"
+            "{}",
+            dataset.uploaded_part_info()
         );
     }
 
     if manifest.all_uploaded() {
-        let manifest_path = manifest_file_path(
+        let manifest_path = manifest_path_for_dataset(
             &config.raw_spool_dir,
             config.exchange.as_str(),
             config.stream_symbol.as_str(),
             date_key,
+            dataset,
         );
         if path_exists(&manifest_path).await {
             fs::remove_file(&manifest_path)
                 .await
                 .with_context(|| {
                     format!(
-                        "failed to remove completed raw parquet manifest {}",
+                        "failed to remove completed parquet manifest {}",
                         manifest_path.display()
                     )
                 })?;
         }
 
-        info!(date_key, "uploaded all raw bookTicker parquet parts for day");
+        info!(date_key, "{}", dataset.all_uploaded_info());
     }
 
     Ok(PartUploadResult {
@@ -224,244 +336,84 @@ async fn process_previous_day_parquet_parts(
     })
 }
 
-async fn process_previous_day_depth_delta_parts(
-    config: &AppConfig,
-    date_key: &str,
-) -> Result<PartUploadResult> {
-    let mut manifest =
-        match load_or_rebuild_depth_delta_manifest_for_upload(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            date_key,
-        )
-        .await?
-        {
-            Some(manifest) => manifest,
-            None => {
-                return Ok(PartUploadResult {
-                    found_parts: false,
-                    uploaded_rows: 0,
-                });
-            }
-        };
-
-    if manifest.parts.is_empty() {
-        return Ok(PartUploadResult {
-            found_parts: false,
-            uploaded_rows: 0,
-        });
-    }
-
-    manifest.parts.sort_by_key(|part| part.part_index);
-
-    let Some(bucket) = &config.s3_bucket else {
-        warn!("APP_S3_BUCKET is not set; keeping local depth-delta parquet spool parts until bucket is configured");
-        return Ok(PartUploadResult {
-            found_parts: true,
-            uploaded_rows: 0,
-        });
-    };
-
-    let mut uploaded_rows = 0_usize;
-
-    for index in 0..manifest.parts.len() {
-        let part = manifest.parts[index].clone();
-        let part_path = config.raw_spool_dir.join(part.file_name.as_str());
-
-        if part.uploaded {
-            if path_exists(&part_path).await {
-                if let Err(error) = fs::remove_file(&part_path).await {
-                    warn!(%error, path = %part_path.display(), "failed to cleanup uploaded local depth-delta parquet part");
-                }
-            }
-            continue;
-        }
-
-        if !path_exists(&part_path).await {
-            return Err(anyhow::anyhow!(
-                "depth-delta parquet manifest references missing part file {}",
-                part_path.display()
-            ));
-        }
-
-        let object_key = object_key_for_part(config, date_key, part.file_name.as_str());
-
-        upload_and_verify(bucket, object_key.as_str(), &part_path).await?;
-
-        manifest.parts[index].uploaded = true;
-        save_depth_delta_manifest(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            &manifest,
-        )
-        .await?;
-
-        if let Err(error) = fs::remove_file(&part_path).await {
-            warn!(%error, path = %part_path.display(), "uploaded depth-delta parquet part but local cleanup failed");
-        }
-
-        uploaded_rows = uploaded_rows.saturating_add(part.row_count);
-
-        info!(
-            bucket,
-            key = %object_key,
-            rows = part.row_count,
-            "uploaded raw depth-delta parquet part"
-        );
-    }
-
-    if manifest.all_uploaded() {
-        let manifest_path = depth_delta_manifest_file_path(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            date_key,
-        );
-        if path_exists(&manifest_path).await {
-            fs::remove_file(&manifest_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to remove completed depth-delta parquet manifest {}",
-                        manifest_path.display()
-                    )
-                })?;
-        }
-
-        info!(date_key, "uploaded all raw depth-delta parquet parts for day");
-    }
-
-    Ok(PartUploadResult {
-        found_parts: true,
-        uploaded_rows,
-    })
-}
-
-async fn process_previous_day_snapshot_parts(
-    config: &AppConfig,
-    date_key: &str,
-) -> Result<PartUploadResult> {
-    let mut manifest =
-        match load_or_rebuild_snapshot_manifest_for_upload(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            date_key,
-        )
-        .await?
-        {
-            Some(manifest) => manifest,
-            None => {
-                return Ok(PartUploadResult {
-                    found_parts: false,
-                    uploaded_rows: 0,
-                });
-            }
-        };
-
-    if manifest.parts.is_empty() {
-        return Ok(PartUploadResult {
-            found_parts: false,
-            uploaded_rows: 0,
-        });
-    }
-
-    manifest.parts.sort_by_key(|part| part.part_index);
-
-    let Some(bucket) = &config.s3_bucket else {
-        warn!("APP_S3_BUCKET is not set; keeping local snapshot parquet spool parts until bucket is configured");
-        return Ok(PartUploadResult {
-            found_parts: true,
-            uploaded_rows: 0,
-        });
-    };
-
-    let mut uploaded_rows = 0_usize;
-
-    for index in 0..manifest.parts.len() {
-        let part = manifest.parts[index].clone();
-        let part_path = config.raw_spool_dir.join(part.file_name.as_str());
-
-        if part.uploaded {
-            if path_exists(&part_path).await {
-                if let Err(error) = fs::remove_file(&part_path).await {
-                    warn!(%error, path = %part_path.display(), "failed to cleanup uploaded local snapshot parquet part");
-                }
-            }
-            continue;
-        }
-
-        if !path_exists(&part_path).await {
-            return Err(anyhow::anyhow!(
-                "snapshot parquet manifest references missing part file {}",
-                part_path.display()
-            ));
-        }
-
-        let object_key = object_key_for_part(config, date_key, part.file_name.as_str());
-
-        upload_and_verify(bucket, object_key.as_str(), &part_path).await?;
-
-        manifest.parts[index].uploaded = true;
-        save_snapshot_manifest(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            &manifest,
-        )
-        .await?;
-
-        if let Err(error) = fs::remove_file(&part_path).await {
-            warn!(%error, path = %part_path.display(), "uploaded snapshot parquet part but local cleanup failed");
-        }
-
-        uploaded_rows = uploaded_rows.saturating_add(part.row_count);
-
-        info!(
-            bucket,
-            key = %object_key,
-            rows = part.row_count,
-            "uploaded raw snapshot parquet part"
-        );
-    }
-
-    if manifest.all_uploaded() {
-        let manifest_path = snapshot_manifest_file_path(
-            &config.raw_spool_dir,
-            config.exchange.as_str(),
-            config.stream_symbol.as_str(),
-            date_key,
-        );
-        if path_exists(&manifest_path).await {
-            fs::remove_file(&manifest_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to remove completed snapshot parquet manifest {}",
-                        manifest_path.display()
-                    )
-                })?;
-        }
-
-        info!(date_key, "uploaded all raw snapshot parquet parts for day");
-    }
-
-    Ok(PartUploadResult {
-        found_parts: true,
-        uploaded_rows,
-    })
-}
-
-async fn load_or_rebuild_manifest_for_upload(
+fn manifest_path_for_dataset(
     spool_dir: &Path,
     exchange: &str,
     symbol: &str,
     date_key: &str,
+    dataset: DatasetKind,
+) -> PathBuf {
+    match dataset {
+        DatasetKind::BookTicker => manifest_file_path(spool_dir, exchange, symbol, date_key),
+        DatasetKind::DepthDelta => {
+            depth_delta_manifest_file_path(spool_dir, exchange, symbol, date_key)
+        }
+        DatasetKind::Snapshot => snapshot_manifest_file_path(spool_dir, exchange, symbol, date_key),
+    }
+}
+
+async fn load_manifest_for_dataset(
+    spool_dir: &Path,
+    exchange: &str,
+    symbol: &str,
+    date_key: &str,
+    dataset: DatasetKind,
 ) -> Result<Option<RawParquetManifest>> {
-    if let Some(manifest) = load_raw_parquet_manifest(spool_dir, exchange, symbol, date_key).await? {
-        let discovered_parts = list_raw_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
+    match dataset {
+        DatasetKind::BookTicker => {
+            load_raw_parquet_manifest(spool_dir, exchange, symbol, date_key).await
+        }
+        DatasetKind::DepthDelta => {
+            load_depth_delta_manifest(spool_dir, exchange, symbol, date_key).await
+        }
+        DatasetKind::Snapshot => load_snapshot_manifest(spool_dir, exchange, symbol, date_key).await,
+    }
+}
+
+async fn list_parts_for_dataset(
+    spool_dir: &Path,
+    exchange: &str,
+    symbol: &str,
+    date_key: &str,
+    dataset: DatasetKind,
+) -> Result<Vec<RawParquetPartEntry>> {
+    match dataset {
+        DatasetKind::BookTicker => list_raw_parquet_parts(spool_dir, exchange, symbol, date_key).await,
+        DatasetKind::DepthDelta => {
+            list_depth_delta_parquet_parts(spool_dir, exchange, symbol, date_key).await
+        }
+        DatasetKind::Snapshot => {
+            list_snapshot_parquet_parts(spool_dir, exchange, symbol, date_key).await
+        }
+    }
+}
+
+async fn save_manifest_for_dataset(
+    spool_dir: &Path,
+    exchange: &str,
+    symbol: &str,
+    dataset: DatasetKind,
+    manifest: &RawParquetManifest,
+) -> Result<()> {
+    match dataset {
+        DatasetKind::BookTicker => save_raw_parquet_manifest(spool_dir, exchange, symbol, manifest).await,
+        DatasetKind::DepthDelta => {
+            save_depth_delta_manifest(spool_dir, exchange, symbol, manifest).await
+        }
+        DatasetKind::Snapshot => save_snapshot_manifest(spool_dir, exchange, symbol, manifest).await,
+    }
+}
+
+async fn load_or_rebuild_manifest_for_dataset(
+    spool_dir: &Path,
+    exchange: &str,
+    symbol: &str,
+    date_key: &str,
+    dataset: DatasetKind,
+) -> Result<Option<RawParquetManifest>> {
+    if let Some(manifest) = load_manifest_for_dataset(spool_dir, exchange, symbol, date_key, dataset).await?
+    {
+        let discovered_parts = list_parts_for_dataset(spool_dir, exchange, symbol, date_key, dataset).await?;
         let (manifest, orphaned_count) =
             reconcile_manifest_with_discovered_parts(manifest, discovered_parts);
         if orphaned_count > 0 {
@@ -470,89 +422,22 @@ async fn load_or_rebuild_manifest_for_upload(
                 exchange,
                 symbol,
                 orphaned_count,
-                "detected orphaned raw bookTicker parquet parts; appending to manifest upload queue"
+                "{}",
+                dataset.orphaned_parts_warning()
             );
-            save_raw_parquet_manifest(spool_dir, exchange, symbol, &manifest).await?;
+            save_manifest_for_dataset(spool_dir, exchange, symbol, dataset, &manifest).await?;
         }
 
         return Ok(Some(manifest));
     }
 
-    let parts = list_raw_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
+    let parts = list_parts_for_dataset(spool_dir, exchange, symbol, date_key, dataset).await?;
     if parts.is_empty() {
         return Ok(None);
     }
 
     let manifest = build_manifest_from_parts(date_key, parts);
-    save_raw_parquet_manifest(spool_dir, exchange, symbol, &manifest).await?;
-    Ok(Some(manifest))
-}
-
-async fn load_or_rebuild_depth_delta_manifest_for_upload(
-    spool_dir: &Path,
-    exchange: &str,
-    symbol: &str,
-    date_key: &str,
-) -> Result<Option<RawParquetManifest>> {
-    if let Some(manifest) = load_depth_delta_manifest(spool_dir, exchange, symbol, date_key).await? {
-        let discovered_parts = list_depth_delta_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
-        let (manifest, orphaned_count) =
-            reconcile_manifest_with_discovered_parts(manifest, discovered_parts);
-        if orphaned_count > 0 {
-            warn!(
-                date_key,
-                exchange,
-                symbol,
-                orphaned_count,
-                "detected orphaned raw depth-delta parquet parts; appending to manifest upload queue"
-            );
-            save_depth_delta_manifest(spool_dir, exchange, symbol, &manifest).await?;
-        }
-
-        return Ok(Some(manifest));
-    }
-
-    let parts = list_depth_delta_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
-    if parts.is_empty() {
-        return Ok(None);
-    }
-
-    let manifest = build_manifest_from_parts(date_key, parts);
-    save_depth_delta_manifest(spool_dir, exchange, symbol, &manifest).await?;
-    Ok(Some(manifest))
-}
-
-async fn load_or_rebuild_snapshot_manifest_for_upload(
-    spool_dir: &Path,
-    exchange: &str,
-    symbol: &str,
-    date_key: &str,
-) -> Result<Option<RawParquetManifest>> {
-    if let Some(manifest) = load_snapshot_manifest(spool_dir, exchange, symbol, date_key).await? {
-        let discovered_parts = list_snapshot_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
-        let (manifest, orphaned_count) =
-            reconcile_manifest_with_discovered_parts(manifest, discovered_parts);
-        if orphaned_count > 0 {
-            warn!(
-                date_key,
-                exchange,
-                symbol,
-                orphaned_count,
-                "detected orphaned raw snapshot parquet parts; appending to manifest upload queue"
-            );
-            save_snapshot_manifest(spool_dir, exchange, symbol, &manifest).await?;
-        }
-
-        return Ok(Some(manifest));
-    }
-
-    let parts = list_snapshot_parquet_parts(spool_dir, exchange, symbol, date_key).await?;
-    if parts.is_empty() {
-        return Ok(None);
-    }
-
-    let manifest = build_manifest_from_parts(date_key, parts);
-    save_snapshot_manifest(spool_dir, exchange, symbol, &manifest).await?;
+    save_manifest_for_dataset(spool_dir, exchange, symbol, dataset, &manifest).await?;
     Ok(Some(manifest))
 }
 
