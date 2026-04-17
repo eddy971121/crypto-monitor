@@ -150,7 +150,7 @@ write_state
 
 log_info "Soak run label: $RUN_LABEL"
 log_info "Soak output directory: $SOAK_DIR"
-log_info "Starting 4-profile soak run with mode=$MODE"
+log_info "Starting multi-profile soak run with mode=$MODE (all profiles under $PROFILES_DIR)"
 
 START_CMD=("${WORKSPACE_ROOT}/scripts/start_4pairs.sh" "--profiles-dir" "$PROFILES_DIR")
 if [[ "$MODE" == "release" ]]; then

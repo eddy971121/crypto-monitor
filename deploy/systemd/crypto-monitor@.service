@@ -1,0 +1,27 @@
+[Unit]
+Description=crypto-monitor instance (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+WorkingDirectory=/var/lib/crypto-monitor
+ExecStart=/usr/local/bin/crypto-monitor --config /etc/crypto-monitor/%i.env
+Restart=always
+RestartSec=5s
+RestartPreventExitStatus=130
+Environment=RUST_LOG=crypto_monitor=info,orderbook=info,binance=info
+Environment=APP_LOG_FORMAT=json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/crypto-monitor
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

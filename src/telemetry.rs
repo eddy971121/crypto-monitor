@@ -12,6 +12,13 @@ const P99_SLO_MAX_MS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub enum TelemetryEvent {
+    WsConnectAttempt,
+    WsConnected,
+    WsConnectFailure,
+    WsReadError,
+    WsClosed,
+    WsIdleTimeout,
+    WsReconnectScheduled,
     DepthEventReceived,
     AggTradeEventReceived,
     OutOfOrderCorrection,
@@ -31,6 +38,13 @@ pub enum TelemetryEvent {
 
 #[derive(Debug, Default)]
 struct TelemetryState {
+    ws_connect_attempts: u64,
+    ws_connected_sessions: u64,
+    ws_connect_failures: u64,
+    ws_read_errors: u64,
+    ws_closed_events: u64,
+    ws_idle_timeouts: u64,
+    ws_reconnect_scheduled: u64,
     total_depth_events: u64,
     total_agg_trade_events: u64,
     out_of_order_corrections: u64,
@@ -54,6 +68,27 @@ struct TelemetryState {
 impl TelemetryState {
     fn apply(&mut self, event: TelemetryEvent) {
         match event {
+            TelemetryEvent::WsConnectAttempt => {
+                self.ws_connect_attempts = self.ws_connect_attempts.saturating_add(1);
+            }
+            TelemetryEvent::WsConnected => {
+                self.ws_connected_sessions = self.ws_connected_sessions.saturating_add(1);
+            }
+            TelemetryEvent::WsConnectFailure => {
+                self.ws_connect_failures = self.ws_connect_failures.saturating_add(1);
+            }
+            TelemetryEvent::WsReadError => {
+                self.ws_read_errors = self.ws_read_errors.saturating_add(1);
+            }
+            TelemetryEvent::WsClosed => {
+                self.ws_closed_events = self.ws_closed_events.saturating_add(1);
+            }
+            TelemetryEvent::WsIdleTimeout => {
+                self.ws_idle_timeouts = self.ws_idle_timeouts.saturating_add(1);
+            }
+            TelemetryEvent::WsReconnectScheduled => {
+                self.ws_reconnect_scheduled = self.ws_reconnect_scheduled.saturating_add(1);
+            }
             TelemetryEvent::DepthEventReceived => {
                 self.total_depth_events = self.total_depth_events.saturating_add(1);
             }
@@ -157,6 +192,13 @@ fn report_state(state: &TelemetryState) {
     let p99_latency_ms = state.p99_latency_ms();
 
     info!(
+        ws_connect_attempts = state.ws_connect_attempts,
+        ws_connected_sessions = state.ws_connected_sessions,
+        ws_connect_failures = state.ws_connect_failures,
+        ws_read_errors = state.ws_read_errors,
+        ws_closed_events = state.ws_closed_events,
+        ws_idle_timeouts = state.ws_idle_timeouts,
+        ws_reconnect_scheduled = state.ws_reconnect_scheduled,
         total_depth_events = state.total_depth_events,
         total_agg_trade_events = state.total_agg_trade_events,
         out_of_order_corrections = state.out_of_order_corrections,

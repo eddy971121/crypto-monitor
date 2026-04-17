@@ -2,7 +2,7 @@
 mod tests {
     use std::time::Instant;
 
-    use crate::config::ContractType;
+    use crate::config::{ContractType, MarketCategory};
     use crate::types::{
         AggTradeEvent, CancelHeuristic, NormalizedAggTrade, NormalizedDepthUpdate, UnifiedEvent,
     };
@@ -38,7 +38,37 @@ mod tests {
                 pair: Some("BTCUSD".to_string()),
                 first_update_id,
                 final_update_id,
-                prev_final_update_id,
+                prev_final_update_id: Some(prev_final_update_id),
+                bids: bids
+                    .into_iter()
+                    .map(|[price, qty]| [price.to_string(), qty.to_string()])
+                    .collect(),
+                asks: asks
+                    .into_iter()
+                    .map(|[price, qty]| [price.to_string(), qty.to_string()])
+                    .collect(),
+            },
+            recv_ts_ms: 1,
+            recv_instant: Instant::now(),
+        }
+    }
+
+    fn test_spot_event(
+        first_update_id: u64,
+        final_update_id: u64,
+        bids: Vec<[&str; 2]>,
+        asks: Vec<[&str; 2]>,
+    ) -> DepthEvent {
+        DepthEvent {
+            payload: NormalizedDepthUpdate {
+                event_type: "depthUpdate".to_string(),
+                event_time_ms: final_update_id as i64,
+                transaction_time_ms: None,
+                symbol: "BTCUSD".to_string(),
+                pair: None,
+                first_update_id,
+                final_update_id,
+                prev_final_update_id: None,
                 bids: bids
                     .into_iter()
                     .map(|[price, qty]| [price.to_string(), qty.to_string()])
@@ -94,6 +124,7 @@ mod tests {
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         let event = test_event(105, 106, 104, vec![["100.0", "1.0"]], vec![]);
 
@@ -115,6 +146,7 @@ mod tests {
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         sync_engine(&mut state);
 
@@ -132,6 +164,7 @@ mod tests {
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         sync_engine(&mut state);
 
@@ -154,6 +187,7 @@ mod tests {
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         sync_engine(&mut state);
 
@@ -171,11 +205,88 @@ mod tests {
     }
 
     #[test]
+    fn spot_sequence_allows_overlap_without_pu() {
+        let snapshot = DepthSnapshot {
+            symbol: "BTCUSD".to_string(),
+            last_update_id: 100,
+            bids: vec![(100.0, 2.0)],
+            asks: vec![(101.0, 2.0)],
+        };
+
+        let mut state = EngineState::new(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Linear,
+            MarketCategory::Spot,
+        );
+
+        let bridge = test_spot_event(101, 101, vec![["100.0", "2.5"]], vec![]);
+        let bridge_outcome = state.process_depth_event(&bridge, 0.0);
+        assert!(matches!(
+            bridge_outcome,
+            ProcessOutcome::EmitMetric {
+                stale_state: false,
+                ..
+            }
+        ));
+        assert!(state.is_synced);
+        assert_eq!(state.last_update_id, 101);
+
+        let overlap = test_spot_event(101, 102, vec![["100.0", "2.2"]], vec![]);
+        let overlap_outcome = state.process_depth_event(&overlap, 0.0);
+        assert!(matches!(
+            overlap_outcome,
+            ProcessOutcome::EmitMetric {
+                stale_state: false,
+                ..
+            }
+        ));
+        assert_eq!(state.last_update_id, 102);
+    }
+
+    #[test]
+    fn spot_sequence_gap_triggers_resync_without_pu() {
+        let snapshot = DepthSnapshot {
+            symbol: "BTCUSD".to_string(),
+            last_update_id: 100,
+            bids: vec![(100.0, 2.0)],
+            asks: vec![(101.0, 2.0)],
+        };
+
+        let mut state = EngineState::new(
+            &snapshot,
+            CancelHeuristic::Lifo,
+            ContractType::Linear,
+            MarketCategory::Spot,
+        );
+
+        let bridge = test_spot_event(101, 101, vec![["100.0", "2.5"]], vec![]);
+        let bridge_outcome = state.process_depth_event(&bridge, 0.0);
+        assert!(matches!(
+            bridge_outcome,
+            ProcessOutcome::EmitMetric {
+                stale_state: false,
+                ..
+            }
+        ));
+
+        let gap = test_spot_event(103, 103, vec![["100.0", "2.3"]], vec![]);
+        let gap_outcome = state.process_depth_event(&gap, 0.0);
+        assert!(matches!(
+            gap_outcome,
+            ProcessOutcome::Resync {
+                reason: ResyncReason::SequenceGap
+            }
+        ));
+    }
+
+    #[test]
     fn replace_snapshot_resets_sync_state() {
         let mut state = EngineState::new(
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         sync_engine(&mut state);
 
@@ -326,7 +437,7 @@ mod tests {
             pair: Some("BTCUSD".to_string()),
             first_update_id: 101,
             final_update_id: 101,
-            prev_final_update_id: 100,
+            prev_final_update_id: Some(100),
             bids: vec![
                 ["95.0".to_string(), "3.0".to_string()],
                 ["76.0".to_string(), "3.0".to_string()],
@@ -365,7 +476,7 @@ mod tests {
             pair: Some("BTCUSD".to_string()),
             first_update_id: 101,
             final_update_id: 101,
-            prev_final_update_id: 100,
+            prev_final_update_id: Some(100),
             bids: vec![["100.0".to_string(), "5.0".to_string()]],
             asks: Vec::new(),
         };
@@ -382,7 +493,7 @@ mod tests {
             pair: Some("BTCUSD".to_string()),
             first_update_id: 102,
             final_update_id: 102,
-            prev_final_update_id: 101,
+            prev_final_update_id: Some(101),
             bids: vec![["100.0".to_string(), "3.0".to_string()]],
             asks: Vec::new(),
         };
@@ -483,6 +594,7 @@ mod tests {
             &test_snapshot(100),
             CancelHeuristic::Lifo,
             ContractType::Inverse { contract_size: 100.0 },
+            MarketCategory::CoinM,
         );
         sync_engine(&mut state);
 

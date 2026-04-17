@@ -58,6 +58,8 @@ if [[ ${#PROFILE_FILES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+echo "resolved ${#PROFILE_FILES[@]} profile(s) from ${PROFILES_DIR}"
+
 RUN_LABEL="$(date -u +%Y%m%d-%H%M%S)"
 RUN_DIR="${ROOT_DIR}/logs/multi/${RUN_LABEL}"
 mkdir -p "${RUN_DIR}"

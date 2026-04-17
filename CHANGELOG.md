@@ -7,6 +7,15 @@ The format is based on Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Websocket dead-man and reconnect controls: `APP_WS_READ_IDLE_TIMEOUT_SECS`, `APP_WS_RECONNECT_BACKOFF_MAX_SECS`, and `APP_WS_RECONNECT_JITTER_BPS`.
+- Runtime systemd notify toggle `APP_SYSTEMD_NOTIFY_ENABLED` and health-loop READY/WATCHDOG signaling support.
+- Runtime log format toggle `APP_LOG_FORMAT` with compact/json output modes for CloudWatch-friendly structured logs.
+- Websocket reliability telemetry counters: connect attempts/successes/failures, read errors, idle timeouts, close events, and reconnect scheduling.
+- Global CLI `--config <env_file>` support for loading profile env files without shell source indirection.
+- EC2 systemd template unit at `deploy/systemd/crypto-monitor@.service` for per-profile instance supervision.
+- EC2 bootstrap helper script `scripts/install_ec2_systemd.sh` for unit install, env deployment, and instance enable/start.
+- Deployment guide `docs/AWS_EC2_DEPLOYMENT.md` covering IMDSv2, chrony, watchdog, and soak validation phases.
+- CloudWatch alarm playbook `docs/AWS_CLOUDWATCH_ALARMS.md` with AWS CLI metric-filter and alarm examples.
 - Runtime scaffold for multi-task crypto monitor service.
 - Binance COIN-M collector for depthUpdate (100ms) and bookTicker streams.
 - REST snapshot bootstrap for orderbook initialization and resync.
@@ -59,6 +68,11 @@ The format is based on Keep a Changelog.
 - Added regression test coverage to assert snapshot parquet schema fields use parallel numeric arrays (`bid_prices`, `bid_sizes`, `ask_prices`, `ask_sizes`).
 
 ### Changed
+- Binance collector read loop now applies a dead-man timeout to detect half-open silent websocket sessions and force reconnect.
+- Websocket reconnect delay now uses jittered exponential backoff to reduce synchronized reconnect bursts.
+- Health reporter now supports systemd watchdog heartbeat pings in addition to existing service health logs.
+- Health reporter now supports Linux abstract-namespace `NOTIFY_SOCKET` addresses (`@name`) for systemd READY/WATCHDOG notifications.
+- Operations docs now include EC2 bootstrap and CloudWatch alarm references.
 - Upgraded runtime dependencies to support websocket collection, parquet conversion, and S3 upload.
 - Startup now installs rustls ring CryptoProvider explicitly to avoid runtime TLS provider panics.
 - Changed same-timestamp reorder behavior to process AggTrade before Depth events.

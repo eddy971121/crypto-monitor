@@ -9,7 +9,12 @@ pub async fn run_engine(
 ) -> Result<()> {
     let http_client = Client::new();
     let snapshot = fetch_snapshot_with_retry(&config, &http_client).await?;
-    let mut engine = EngineState::new(&snapshot, config.cancel_heuristic, config.contract_type);
+    let mut engine = EngineState::new(
+        &snapshot,
+        config.cancel_heuristic,
+        config.contract_type,
+        config.market_category,
+    );
 
     let bootstrap_snapshot_ts_ms = now_utc_ms();
     emit_snapshot_event(
@@ -677,7 +682,10 @@ fn build_signal_metric(
         spoof_score: spoof_signal.score,
         spoof_reason_code: spoof_signal.reason_code,
         depth_update_u: event.payload.final_update_id,
-        depth_update_pu: event.payload.prev_final_update_id,
+        depth_update_pu: event
+            .payload
+            .prev_final_update_id
+            .unwrap_or_else(|| event.payload.first_update_id.saturating_sub(1)),
         ingest_to_signal_ms: event.recv_instant.elapsed().as_millis() as u64,
     })
 }

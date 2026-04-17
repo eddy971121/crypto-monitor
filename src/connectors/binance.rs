@@ -1,10 +1,11 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tracing::{error, info, warn};
 
@@ -18,6 +19,7 @@ use crate::types::{
 
 #[derive(Debug, Deserialize)]
 struct CombinedStreamEnvelope {
+    stream: String,
     data: serde_json::Value,
 }
 
@@ -48,7 +50,7 @@ struct BinanceDepthUpdate {
     #[serde(rename = "u")]
     final_update_id: u64,
     #[serde(rename = "pu")]
-    prev_final_update_id: u64,
+    prev_final_update_id: Option<u64>,
     #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
@@ -58,11 +60,11 @@ struct BinanceDepthUpdate {
 #[derive(Debug, Deserialize)]
 struct BinanceBookTicker {
     #[serde(rename = "e")]
-    event_type: String,
+    event_type: Option<String>,
     #[serde(rename = "u")]
     update_id: u64,
     #[serde(rename = "E")]
-    event_time_ms: i64,
+    event_time_ms: Option<i64>,
     #[serde(rename = "T")]
     transaction_time_ms: Option<i64>,
     #[serde(rename = "s")]
@@ -124,24 +126,58 @@ pub async fn run_collector(
         config.ws_base_url, stream_path
     );
 
-    let mut reconnect_backoff = 1_u64;
+    let mut reconnect_backoff_secs = 1_u64;
+    let mut reconnect_attempt = 0_u64;
+    let read_idle_timeout = Duration::from_secs(config.ws_read_idle_timeout_secs);
 
     loop {
-        info!(url = %stream_url, "connecting to Binance combined stream");
+        reconnect_attempt = reconnect_attempt.saturating_add(1);
+        send_telemetry(&telemetry_tx, TelemetryEvent::WsConnectAttempt).await;
+        info!(
+            url = %stream_url,
+            reconnect_attempt,
+            "connecting to Binance combined stream"
+        );
+
         match connect_async(stream_url.as_str()).await {
             Ok((ws_stream, _)) => {
                 info!("websocket connected");
-                reconnect_backoff = 1;
+                send_telemetry(&telemetry_tx, TelemetryEvent::WsConnected).await;
+                reconnect_backoff_secs = 1;
 
                 let (_, mut read) = ws_stream.split();
-                while let Some(message_result) = read.next().await {
-                    let message = match message_result {
-                        Ok(message) => message,
-                        Err(error) => {
-                            warn!(%error, "websocket read error; reconnecting");
+                loop {
+                    let next_message = match timeout(read_idle_timeout, read.next()).await {
+                        Ok(Some(message_result)) => message_result,
+                        Ok(None) => {
+                            warn!("websocket stream closed by remote peer; reconnecting");
+                            send_telemetry(&telemetry_tx, TelemetryEvent::WsClosed).await;
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                idle_timeout_secs = config.ws_read_idle_timeout_secs,
+                                "websocket dead-man timeout triggered (no frames received); reconnecting"
+                            );
+                            send_telemetry(&telemetry_tx, TelemetryEvent::WsIdleTimeout).await;
                             break;
                         }
                     };
+
+                    let message = match next_message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            warn!(%error, "websocket read error; reconnecting");
+                            send_telemetry(&telemetry_tx, TelemetryEvent::WsReadError).await;
+                            break;
+                        }
+                    };
+
+                    if message.is_close() {
+                        warn!("websocket close frame received; reconnecting");
+                        send_telemetry(&telemetry_tx, TelemetryEvent::WsClosed).await;
+                        break;
+                    }
 
                     if !message.is_text() {
                         continue;
@@ -164,16 +200,14 @@ pub async fn run_collector(
                         }
                     };
 
-                    let Some(event_type) = envelope
-                        .data
-                        .get("e")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string())
-                    else {
-                        continue;
-                    };
+                    let event_type = envelope.data.get("e").and_then(|value| value.as_str());
+                    let stream_name = envelope.stream.to_ascii_lowercase();
 
-                    if event_type == "depthUpdate" {
+                    let is_depth_stream = stream_name.contains("@depth");
+                    let is_book_ticker_stream = stream_name.contains("@bookticker");
+                    let is_agg_trade_stream = stream_name.contains("@aggtrade");
+
+                    if event_type == Some("depthUpdate") || is_depth_stream {
                         if let Err(error) = forward_depth_event(&envelope.data, &depth_tx).await {
                             warn!(%error, "failed to forward depth event");
                             send_telemetry(&telemetry_tx, TelemetryEvent::ParserError).await;
@@ -181,7 +215,7 @@ pub async fn run_collector(
                         continue;
                     }
 
-                    if event_type == "bookTicker" {
+                    if event_type == Some("bookTicker") || is_book_ticker_stream {
                         if let Err(error) =
                             forward_book_ticker_event(&envelope.data, &book_ticker_tx).await
                         {
@@ -191,7 +225,7 @@ pub async fn run_collector(
                         continue;
                     }
 
-                    if event_type == "aggTrade" {
+                    if event_type == Some("aggTrade") || is_agg_trade_stream {
                         if let Err(error) =
                             forward_agg_trade_event(&envelope.data, &agg_trade_tx).await
                         {
@@ -203,13 +237,58 @@ pub async fn run_collector(
             }
             Err(error) => {
                 warn!(%error, "failed to connect websocket; retrying");
+                send_telemetry(&telemetry_tx, TelemetryEvent::WsConnectFailure).await;
             }
         }
 
-        let wait_secs = reconnect_backoff.min(30);
-        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-        reconnect_backoff = reconnect_backoff.saturating_mul(2).min(30);
+        let wait_secs = reconnect_backoff_secs.min(config.ws_reconnect_backoff_max_secs);
+        let wait_duration = compute_backoff_wait_duration(
+            wait_secs,
+            config.ws_reconnect_jitter_bps,
+            reconnect_attempt,
+        );
+
+        send_telemetry(&telemetry_tx, TelemetryEvent::WsReconnectScheduled).await;
+        info!(
+            base_wait_secs = wait_secs,
+            wait_ms = wait_duration.as_millis() as u64,
+            jitter_bps = config.ws_reconnect_jitter_bps,
+            "scheduling websocket reconnect"
+        );
+
+        tokio::time::sleep(wait_duration).await;
+        reconnect_backoff_secs = reconnect_backoff_secs
+            .saturating_mul(2)
+            .min(config.ws_reconnect_backoff_max_secs);
     }
+}
+
+fn compute_backoff_wait_duration(base_wait_secs: u64, jitter_bps: u16, attempt: u64) -> Duration {
+    let base_wait_ms = base_wait_secs.saturating_mul(1000).max(1);
+    if jitter_bps == 0 {
+        return Duration::from_millis(base_wait_ms);
+    }
+
+    let jitter_span_ms = ((u128::from(base_wait_ms) * u128::from(jitter_bps)) / 10_000_u128) as u64;
+    if jitter_span_ms == 0 {
+        return Duration::from_millis(base_wait_ms);
+    }
+
+    let jitter_window = jitter_span_ms.saturating_mul(2).saturating_add(1);
+    let seed = reconnect_jitter_seed(attempt);
+    let jitter_offset_ms = (seed % jitter_window) as i64 - jitter_span_ms as i64;
+    let jittered_wait_ms = (base_wait_ms as i64 + jitter_offset_ms).max(100) as u64;
+
+    Duration::from_millis(jittered_wait_ms)
+}
+
+fn reconnect_jitter_seed(attempt: u64) -> u64 {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_nanos() & u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+
+    now_nanos ^ attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn build_stream_path(
@@ -266,9 +345,9 @@ fn normalize_depth_update(raw: BinanceDepthUpdate) -> NormalizedDepthUpdate {
 
 fn normalize_book_ticker(raw: BinanceBookTicker) -> NormalizedBookTicker {
     NormalizedBookTicker {
-        event_type: raw.event_type,
+        event_type: raw.event_type.unwrap_or_else(|| "bookTicker".to_string()),
         update_id: raw.update_id,
-        event_time_ms: raw.event_time_ms,
+        event_time_ms: raw.event_time_ms.unwrap_or_else(corrected_utc_ms),
         transaction_time_ms: raw.transaction_time_ms,
         symbol: raw.symbol,
         pair: raw.pair,
@@ -441,6 +520,7 @@ mod tests {
         assert_eq!(depth.pair.as_deref(), Some("BTCUSD"));
         assert_eq!(depth.transaction_time_ms, Some(1_710_000_000_001i64));
         assert_eq!(depth.first_update_id, 100u64);
+        assert_eq!(depth.prev_final_update_id, Some(99u64));
 
         let ticker_raw: BinanceBookTicker = serde_json::from_value(json!({
             "e": "bookTicker",
@@ -499,6 +579,7 @@ mod tests {
         assert_eq!(depth.symbol, "BTCUSDT");
         assert_eq!(depth.pair, None);
         assert_eq!(depth.transaction_time_ms, None);
+        assert_eq!(depth.prev_final_update_id, Some(199u64));
 
         let ticker_raw: BinanceBookTicker = serde_json::from_value(json!({
             "e": "bookTicker",
@@ -534,5 +615,36 @@ mod tests {
         assert_eq!(trade.pair, None);
         assert_eq!(trade.quantity, "0.05");
         assert!(!trade.buyer_is_maker);
+    }
+
+    #[test]
+    fn normalizes_spot_payloads_without_futures_only_fields() {
+        let depth_raw: BinanceDepthUpdate = serde_json::from_value(json!({
+            "e": "depthUpdate",
+            "E": 1_710_200_000_000i64,
+            "s": "BTCUSD",
+            "U": 300u64,
+            "u": 301u64,
+            "b": [["64020.0", "0.25"]],
+            "a": [["64020.1", "0.50"]]
+        }))
+        .expect("spot depth payload should decode");
+        let depth = normalize_depth_update(depth_raw);
+        assert_eq!(depth.symbol, "BTCUSD");
+        assert_eq!(depth.prev_final_update_id, None);
+
+        let ticker_raw: BinanceBookTicker = serde_json::from_value(json!({
+            "u": 1_501u64,
+            "s": "BTCUSD",
+            "b": "64020.0",
+            "B": "0.10",
+            "a": "64020.1",
+            "A": "0.20"
+        }))
+        .expect("spot bookTicker payload should decode");
+        let ticker = normalize_book_ticker(ticker_raw);
+        assert_eq!(ticker.symbol, "BTCUSD");
+        assert_eq!(ticker.event_type, "bookTicker");
+        assert!(ticker.event_time_ms > 0);
     }
 }

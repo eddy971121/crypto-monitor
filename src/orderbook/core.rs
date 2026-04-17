@@ -833,6 +833,7 @@ struct EngineState {
     trade_matcher: AggTradeMatcher,
     cvd_tracker: CvdTracker,
     spoof_threshold_tracker: SpoofThresholdTracker,
+    market_category: MarketCategory,
     last_update_id: u64,
     is_synced: bool,
 }
@@ -842,12 +843,14 @@ impl EngineState {
         snapshot: &DepthSnapshot,
         cancel_heuristic: CancelHeuristic,
         contract_type: ContractType,
+        market_category: MarketCategory,
     ) -> Self {
         Self {
             orderbook: LocalOrderBook::from_snapshot(snapshot, cancel_heuristic, contract_type),
             trade_matcher: AggTradeMatcher::new(AGGTRADE_MATCH_WINDOW_MS),
             cvd_tracker: CvdTracker::new(),
             spoof_threshold_tracker: SpoofThresholdTracker::new(SPOOF_THRESHOLD_WINDOW_MS),
+            market_category,
             last_update_id: snapshot.last_update_id,
             is_synced: false,
         }
@@ -923,7 +926,15 @@ impl EngineState {
             return ProcessOutcome::Ignore;
         }
 
-        if event.payload.prev_final_update_id != self.last_update_id {
+        let bridge_target = self.last_update_id.saturating_add(1);
+
+        if self.market_category.uses_prev_final_update_id() {
+            if event.payload.prev_final_update_id != Some(self.last_update_id) {
+                return ProcessOutcome::Resync {
+                    reason: ResyncReason::SequenceGap,
+                };
+            }
+        } else if event.payload.first_update_id > bridge_target {
             return ProcessOutcome::Resync {
                 reason: ResyncReason::SequenceGap,
             };

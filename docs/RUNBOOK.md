@@ -2,6 +2,7 @@
 
 ## Startup
 1. Set environment variables (.env style) for symbol, stream toggles, storage, and optional ClickHouse/S3.
+	- For CloudWatch parsing on EC2, set APP_LOG_FORMAT=json.
 2. Run cargo check.
 3. Start service with cargo run.
 4. Confirm logs show:
@@ -11,12 +12,17 @@
 - runtime telemetry
 - service health heartbeat
 
-## Multi-Profile Startup (4 Instruments)
+## Multi-Profile Startup (All Profiles)
 Use the predefined profile files under env/profiles for:
 - Binance COIN-M BTCUSD_PERP
 - Binance COIN-M ETHUSD_PERP
 - Binance USD-M BTCUSDT
 - Binance USD-M ETHUSDT
+- Binance SPOT BTCUSD
+- Binance SPOT ETHUSD
+
+Operational note:
+- The scripts below discover all *.env profile files under env/profiles automatically.
 
 Start all profiles:
 
@@ -45,9 +51,62 @@ Stop a specific run label:
 scripts/stop_4pairs.sh --run-label 20260416-120000
 ```
 
+## systemd Startup (EC2)
+Use template unit `deploy/systemd/crypto-monitor@.service` to run one process per profile.
+
+Fast-path helper:
+
+```bash
+scripts/install_ec2_systemd.sh
+```
+
+Install template and profile env files:
+
+```bash
+sudo install -D -m 0644 deploy/systemd/crypto-monitor@.service /etc/systemd/system/crypto-monitor@.service
+sudo mkdir -p /etc/crypto-monitor /var/lib/crypto-monitor
+sudo cp env/profiles/*.env /etc/crypto-monitor/
+sudo systemctl daemon-reload
+```
+
+Start one profile instance (example):
+
+```bash
+sudo systemctl enable --now crypto-monitor@binance-usdm-btcusdt
+```
+
+Service controls:
+
+```bash
+sudo systemctl status crypto-monitor@binance-usdm-btcusdt
+sudo systemctl restart crypto-monitor@binance-usdm-btcusdt
+sudo systemctl stop crypto-monitor@binance-usdm-btcusdt
+```
+
+Watchdog notes:
+- Unit uses `Type=notify` and `WatchdogSec=30s`.
+- Runtime sends READY and WATCHDOG signals when APP_SYSTEMD_NOTIFY_ENABLED=true.
+- If watchdog pings stop, systemd restarts the process.
+
 ## Shutdown
 1. Send Ctrl+C.
 2. Confirm graceful shutdown log line appears.
+
+## Connection Liveness Controls
+Tune websocket dead-man and reconnect behavior with:
+- APP_WS_READ_IDLE_TIMEOUT_SECS: reconnect if no websocket frame is received within this timeout.
+- APP_WS_RECONNECT_BACKOFF_MAX_SECS: reconnect backoff cap.
+- APP_WS_RECONNECT_JITTER_BPS: reconnect jitter in bps (1000 = +/-10%).
+
+Watch runtime telemetry for:
+- ws_connect_attempts
+- ws_connected_sessions
+- ws_connect_failures
+- ws_read_errors
+- ws_idle_timeouts
+- ws_reconnect_scheduled
+
+CloudWatch metric filter and alarm examples are documented in `docs/AWS_CLOUDWATCH_ALARMS.md`.
 
 ## Stale-State Interpretation
 - stale_state=true means local orderbook is in degraded confidence mode.
@@ -77,7 +136,7 @@ cargo run -- upload-once --yesterday
 cargo run -- upload-once --date 2026-04-14
 ```
 
-For all four profile environments with report output:
+For all profile environments with report output:
 
 ```bash
 scripts/verify_s3_upload_4pairs.sh --date 2026-04-16 --release
@@ -132,7 +191,7 @@ Manual recovery procedure:
 4. If manifest references a non-existent part file, restore that part from backup or remove inconsistent manifest and re-spool for that date.
 5. Resume service and monitor telemetry for s3_upload_successes and s3_upload_failures.
 
-Archive integrity check across all 4 profiles:
+Archive integrity check across all profiles:
 
 ```bash
 scripts/verify_archive_integrity_4pairs.sh --date 2026-04-16

@@ -1,6 +1,6 @@
 # crypto-monitor
 
-Low-latency market microstructure monitor for Binance futures (COIN-M and USD-M) with:
+Low-latency market microstructure monitor for Binance spot and futures (COIN-M and USD-M) with:
 
 - real-time depth, bookTicker, and aggTrade ingestion
 - local orderbook reconstruction with sequence safety and resync
@@ -16,6 +16,8 @@ Profile env files are provided in env/profiles for:
 - Binance COIN-M ETHUSD_PERP
 - Binance USD-M BTCUSDT
 - Binance USD-M ETHUSDT
+- Binance SPOT BTCUSD
+- Binance SPOT ETHUSD
 
 ## Quick Start
 
@@ -32,7 +34,13 @@ cargo build
 cargo run
 ```
 
-4. Run four predefined profiles:
+Run with an explicit env profile file:
+
+```bash
+cargo run -- --config env/profiles/binance-usdm-btcusdt.env
+```
+
+4. Run all predefined profiles from env/profiles:
 
 ```bash
 scripts/start_4pairs.sh --release
@@ -68,10 +76,26 @@ cargo run -- upload-once --yesterday
 ## Operations Docs
 
 - docs/RUNBOOK.md
+- docs/AWS_EC2_DEPLOYMENT.md
+- docs/AWS_CLOUDWATCH_ALARMS.md
 - docs/MIGRATION_JSONL_TO_CLICKHOUSE.md
 - docs/IMPLEMENTATION_MILESTONE_CHECKLIST_MULTI_MARKET.md
 - docs/EXCHANGE_CONNECTOR_ONBOARDING_TEMPLATE.md
 - docs/PAIR_ONBOARDING_TEMPLATE.md
+
+## EC2 Bootstrap
+
+Bootstrap systemd unit installation and profile enable/start on EC2:
+
+```bash
+scripts/install_ec2_systemd.sh
+```
+
+Select a subset of profiles:
+
+```bash
+scripts/install_ec2_systemd.sh --profiles binance-usdm-btcusdt,binance-usdm-ethusdt
+```
 
 ## Notes
 

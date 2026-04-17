@@ -25,7 +25,7 @@ pub struct NormalizedDepthUpdate {
     pub pair: Option<String>,
     pub first_update_id: u64,
     pub final_update_id: u64,
-    pub prev_final_update_id: u64,
+    pub prev_final_update_id: Option<u64>,
     pub bids: Vec<[String; 2]>,
     pub asks: Vec<[String; 2]>,
 }
